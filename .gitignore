@@ -3,3 +3,4 @@ __pycache__/
 .pytest_cache/
 *.pyc
 .claude/settings.local.json
+external/dflash/
