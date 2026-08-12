@@ -19,10 +19,18 @@
 - 训练数据：34,999 条 self-distillation 缓存（Qwen2.5-VL-7B greedy rollouts，TARGET convention），与评估图像双键去重
 - 计时锚点：pooled greedy 29.918 tok/s（旧线数值；新线 verify 形态不同，计时锚点需重新预注册后才可引用）
 
-## 对比 baseline 数值（旧线冠军，只引用不重测）
-- static 速度冠军：1.689×
-- 动态树 dyn_k8_n32：σ=2.841，paired Δ+0.101±0.007
+## 对比 baseline 数值（旧线冠军，只引用不重测；v2 口径）
+- 速度基线（v2 e2e paired，ARCHIVE_POLICY_V2_ANCHOR 2026-08-07）：
+  static_c1_d3 1.705×；速度冠军 dyn_k8_n24 1.732×
+- σ 冠军 dyn_k8_n32：σ=2.841，paired Δ+0.101±0.007（对 static_c1_6432 锚 σ=2.7388）
 - MM-Vet OOD realization rate：R≈0.433±0.039
+- 附注：static 1.689× 为已废弃的 100-scale segmented 口径，仅出现于
+  历史文档与 git tag message，不得用于新线对比
+- 基线归档：/scratch/li96/mz9869/archives/linked_medusa_baseline_20260812_r2.tar.gz
+  （sha256 19abfff806e1fbc6a55e4149a074f4bf35ee68254af08f62cc866dff45da92ee，
+  含 .git 与 tag linked-medusa-final；r1 无 .git 版本保留）
+- 待办：冷藏项约 470–500G（非冠军 ckpt / smoke / v1 / phaseA）论文投稿后再清
+  （本次判定：不删）
 
 ## 工作纪律
 - 预注册优先：所有阈值、统计检验在数据到来前锁定
