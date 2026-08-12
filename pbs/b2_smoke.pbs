@@ -1,0 +1,42 @@
+#!/bin/bash
+#PBS -N b2_smoke
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l ncpus=16
+#PBS -l mem=120GB
+#PBS -l ngpus=1
+#PBS -l walltime=00:45:00
+#PBS -l wd
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B2 SMOKE v2: 8 optimizer steps @ round-accum 256 (~2000 rounds, ~30 prompts).
+# v1 OOM'd: per-prompt backward retained each round's autocast fp16 weight
+# copies (7GB/round) in the graph. v2 backwards PER ROUND (mathematically
+# identical, rounds are independent graphs) -> bounded memory.
+# Gates: per-head CE finite & near B1-converged levels at init (heads were
+# trained for this exact loss offline), no NaN, steady GPU memory well under
+# 80GB (steady expected ~60GB), prompt/s recorded (sizes the full run).
+
+set -euo pipefail
+echo "=== JOB $(hostname) $(date) job=${PBS_JOBID:-unset} ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+python -u -m scripts.train_onpolicy \
+    --total-steps 8 \
+    --round-accum 256 \
+    --lr 1e-4 \
+    --warmup-steps 3 \
+    --log-every 1 \
+    --val-every 0 \
+    --ckpt-every 0 \
+    --val-prompts 5 \
+    --out-dir /scratch/li96/mz9869/medusa_outputs/b2_smoke
+
+echo ""; nvidia-smi --query-gpu=memory.used --format=csv,noheader
+echo "=== DONE $(date) ==="

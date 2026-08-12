@@ -1,0 +1,38 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N diag_3b_postfix
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Post-reflatten: first accepted-diverge layout compare (gate#2 N̄ miss → stop protocol).
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/diag_triad/item6_live_order_post_reflatten
+
+echo "=== 3b POST-REFLATTEN LIVE ORDER $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+# Same indices as prior live-order (llava shuffle); find first diverge after fix
+python3 -u -m scripts.diag_item6_live_order \
+  --ckpt "$C1/ckpt_best.pt" \
+  --indices 10 58 78 85 \
+  --fanout 1 6 4 2 1 \
+  --max-nodes 24 \
+  --out-dir "$OUT"
+
+echo "=== DONE $(date) ==="

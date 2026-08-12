@@ -1,0 +1,48 @@
+#!/bin/bash
+#PBS -N b1_smoke
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l ncpus=16
+#PBS -l mem=120GB
+#PBS -l ngpus=1
+#PBS -l walltime=00:45:00
+#PBS -l wd
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B1 SMOKE: 5-head no-detach chain, warm-start heads 0-2 from Phase A,
+# 150 steps on the general cache. Gates (read from the log):
+#   [sanity §7.1] head_0_loss ~= Phase A level (~1.0; it IS the Phase A head_0)
+#   head_1/head_2 init ~= Phase A converged levels; head_3/4 high (fresh) but FINITE
+#   all five losses trending down, gnorm finite, NO NaN/inf in head_4 -> keep no-detach
+#   head_4 NaN/diverging -> rerun with model.detach_chain=true (fallback fork)
+# NOTE: A100 (not V100) because 5-head fp32 params+grads+8bit optim ~= 35GB > 32GB.
+
+set -euo pipefail
+echo "=== JOB $(hostname) $(date) job=${PBS_JOBID:-unset} ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+DETACH=${DETACH:-false}
+echo "=== detach_chain = $DETACH ==="
+
+python -u -m scripts.train --config config/linked_medusa_default.yaml --override \
+    dataset.kind=cached \
+    dataset.cache_dir=/scratch/li96/mz9869/cached_data/llava_general_35k \
+    dataset.eval_split=null \
+    dataset.val_fraction=0.01 \
+    model.num_heads=5 \
+    model.detach_chain=$DETACH \
+    model.warm_start_from=/scratch/li96/mz9869/medusa_outputs/linked_medusa_phaseA_general/ckpt_best.pt \
+    training.total_steps=150 \
+    "training.loss_weights=[1.0,0.8,0.64,0.512,0.41]" \
+    logging.log_every=5 \
+    logging.eval_every=0 \
+    logging.save_every=0 \
+    logging.output_dir=/scratch/li96/mz9869/medusa_outputs/b1_smoke
+
+echo "=== DONE $(date) ==="

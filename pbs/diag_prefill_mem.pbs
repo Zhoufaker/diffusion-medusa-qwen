@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=01:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N diag_prefill
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/diag_triad
+MAX_PIXELS=501760   # 640 * 28 * 28
+
+echo "=== DIAG PREFILL MEM v2 max_pixels=${MAX_PIXELS} $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+set +e
+python3 -u scripts/diag_prefill_mem.py \
+  --max-pixels "$MAX_PIXELS" \
+  --tree-probe-top 3 \
+  --fanout 1 6 4 3 2 \
+  --max-nodes 32 \
+  --out "$OUT/item5_prefill_mem_${MAX_PIXELS}.json"
+ec=$?
+set -e
+echo "EXIT_CODE=$ec"
+echo "=== DONE $(date) ==="
+exit 0

@@ -1,0 +1,84 @@
+# Linked Medusa Head — default training config
+# Spec ref: linked_medusa_spec.md §3 (hyperparams) + §7 (training loop)
+#
+# Defaults are intentionally "v1 frozen" per spec §10 Locked list. Knobs that
+# are explicitly ablation-allowed (§10) are noted with [ablate].
+#
+# CLI override syntax in scripts/train.py:
+#   --override training.batch_size=8 training.total_steps=20000
+seed: 42
+
+dataset:
+  # 'synthetic'  — random gaussian h_t + uniform tokens; for code structure
+  #                validation before the real cache is uploaded (spec §1.1).
+  # 'cached'     — read precomputed .pt files from cache_dir (spec §6.1).
+  #
+  # When the rsync of /scratch/li96/mz9869/cached_data/qwen25vl_long/ finishes
+  # (46614 .pt files, ~82 GB), flip kind to "cached":
+  #   --override dataset.kind=cached
+  # or edit this file. With kind=cached, num_samples / seq_len_range are
+  # ignored. The cached dataset auto-numerically-sorts <int>.pt files.
+  kind: synthetic
+  cache_dir: /scratch/li96/mz9869/cached_data/qwen25vl_long
+  num_samples: 2000          # synthetic only
+  seq_len_range: [50, 256]   # synthetic only
+  max_length: 256            # truncate longer cache samples to this
+  # eval_split:
+  #   null               -> random_split using val_fraction
+  #   "last_N" or int N  -> reserve the last N samples (numeric-stem order
+  #                          for cached, index order for synthetic) as eval.
+  #                          Reproducible without RNG seed; preferred for
+  #                          cached production runs.
+  eval_split: null
+  val_fraction: 0.05         # used only when eval_split is null
+
+model:
+  hidden_dim: 3584           # Qwen2.5-VL-7B (spec §2)
+  vocab_size: 152064         # lm_head padded physical dim (spec §2)
+  num_heads: 3
+  num_blocks: 2              # [ablate {1, 2, 4}]
+  expansion: 2               # [ablate {1, 2, 4}]
+  init_lm_head_from_base: true
+  base_lm_head_path: /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+  # B1 5-head knobs:
+  # detach_chain: stop-grad h_{k-1}' between heads (fallback if the 5-head
+  #   no-detach chain diverges in smoke; default false = linked premise).
+  # warm_start_from: ckpt whose matching heads.* tensors overwrite the fresh
+  #   init (B1: heads 0-2 from Phase A; heads 3-4 stay fresh). Loaded AFTER
+  #   init_lm_head_from_base, strict=False.
+  detach_chain: false
+  warm_start_from: null
+
+training:
+  total_steps: 10000
+  batch_size: 4              # V100 32GB fits 4-8 with AdamW8bit (spec §9.4)
+  grad_accum_steps: 1
+  num_workers: 4
+  pin_memory: true
+  optimizer: adamw8bit       # spec §3 — must be 8bit on V100
+  lr: 5.0e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  warmup_steps: 100
+  final_lr_multiplier: 0.33  # cosine decay target ratio
+  grad_clip: 1.0
+  loss_weights: [1.0, 0.8, 0.64]   # [ablate uniform [1, 1, 1]]
+  loss_type: ce              # [ablate 'teacher', 'mixed' in v2]
+  use_amp: true              # fp16 + GradScaler on GPU; auto-disabled on CPU
+  # GradScaler init_scale. Default 2**16=65536 is too aggressive for Linked
+  # Medusa init (deep heads amplify residual stream → large grads → overflow).
+  # 2**10=1024 keeps initial scaled grads in fp16 range; scaler will grow if
+  # the network can take more. See trainer.py for the detailed math.
+  grad_scaler_init_scale: 1024
+  resume_from: null          # optional checkpoint path to resume from
+
+logging:
+  log_every: 10
+  eval_every: 500
+  save_every: 1000
+  # Keep the most recent N untagged checkpoints (ckpt_step<N>.pt). The
+  # ckpt_best.pt (lowest eval/total_loss) and ckpt_final.pt are NEVER auto-
+  # pruned. Set to 0 to disable pruning entirely.
+  keep_recent_n: 3
+  output_dir: /scratch/li96/mz9869/medusa_outputs/linked_medusa_v1
+  pbs_logs_dir: /scratch/li96/mz9869/logs

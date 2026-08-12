@@ -1,0 +1,175 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N dyn_sweep300
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Dynamic-tree effect-size sweep (300-prompt). 9 dyn rows + 2 static anchors.
+# Speed denom = locked pooled greedy 29.918 (174150612) — do NOT remeasure greedy.
+# Anchor rows must per-prompt-match bridge_300 archives or whole batch VOID.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/dynamic_sweep_300
+MANIFEST=/scratch/li96/mz9869/eval_manifests/manifest_300.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+ARCH_D3=$C1/bridge_300/c1_d3.json
+ARCH_6432=$C1/bridge_300/c1_6432.json
+POOLED_G=29.917703129942712   # 174150612 clean greedy all300
+
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 300 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --ordered-manifest \
+        --ckpt $C1/ckpt_best.pt --manifest $MANIFEST --images-dir $IMAGES"
+# no --measure-greedy: speed = tree_tok_s / POOLED_G
+
+echo "=== DYNAMIC SWEEP 300 $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT" /scratch/li96/mz9869/logs
+
+run () {
+    local tag=$1; shift
+    echo ""; echo "######## $tag  $* ########"
+    python3 -u -m scripts.eval_acceptance_tree $COMMON "$@" --out "$OUT/$tag.json"
+}
+
+# --- static anchors (regression vs bridge_300) ---
+run anchor_static_c1_d3   --tree-builder static --fanout 1 3 2 1 0 --max-nodes 16
+run anchor_static_c1_6432 --tree-builder static --fanout 1 6 4 3 2 --max-nodes 32
+
+# --- 9 dynamic rows: cand_k ∈ {4,6,8} equal-width × max_nodes ∈ {16,24,32} ---
+# Folded 5-head: fanout = [1, k, k, k, k]
+for K in 4 6 8; do
+  for MN in 16 24 32; do
+    tag="dyn_k${K}_n${MN}"
+    run "$tag" --tree-builder dynamic --fanout 1 "$K" "$K" "$K" "$K" --max-nodes "$MN"
+  done
+done
+
+echo ""; echo "=== SWEEP TABLE + ANCHOR GATES ==="
+python3 - <<'EOF'
+import json, math, statistics, sys
+from pathlib import Path
+
+out = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/dynamic_sweep_300")
+arch_d3 = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/bridge_300/c1_d3.json")
+arch_w = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/bridge_300/c1_6432.json")
+POOLED_G = 29.917703129942712
+SIG_ANCHOR = 2.739   # c1_6432 σ300 display
+SPD_ANCHOR = 1.665   # c1_d3 speed_300 pooled
+
+def load(tag):
+    return json.load(open(out / f"{tag}.json"))
+
+def per_prompt_equal(a, b):
+    pa, pb = a["per_prompt_results"], b["per_prompt_results"]
+    if len(pa) != len(pb):
+        return False, f"n={len(pa)} vs {len(pb)}"
+    for i, (x, y) in enumerate(zip(pa, pb)):
+        if x["id"] != y["id"]:
+            return False, f"id mismatch @{i}: {x['id']} vs {y['id']}"
+        if x["sigma"] != y["sigma"] or x["mean_width"] != y["mean_width"]:
+            return False, f"mismatch @{i} id={x['id']} σ={x['sigma']}vs{y['sigma']} w={x['mean_width']}vs{y['mean_width']}"
+        if x.get("emitted_tokens") != y.get("emitted_tokens"):
+            return False, f"emitted mismatch @{i} id={x['id']}"
+    return True, "OK"
+
+# Anchor gates
+ok = True
+for tag, archp, name in [
+    ("anchor_static_c1_d3", arch_d3, "c1_d3"),
+    ("anchor_static_c1_6432", arch_w, "c1_6432"),
+]:
+    live, arch = load(tag), json.load(open(archp))
+    eq, msg = per_prompt_equal(live, arch)
+    print(f"ANCHOR {name}: per-prompt≡bridge_300? {eq} ({msg})")
+    if not eq:
+        ok = False
+
+if not ok:
+    print("ANCHOR FAIL — whole sweep VOID"); sys.exit(2)
+
+print(f"\n{'tag':>22} {'builder':>8} {'cand':>12} {'mN':>3} {'σ300':>7} {'N̄':>6} "
+      f"{'tree t/s':>8} {'spd_pool':>8}  accept[1..4]")
+rows = []
+# anchors first
+for tag, fan, mn in [
+    ("anchor_static_c1_d3", [1,3,2,1,0], 16),
+    ("anchor_static_c1_6432", [1,6,4,3,2], 32),
+]:
+    d = load(tag)
+    spd = d["tree_tok_per_s"] / POOLED_G
+    acc = d["per_position_accept_rate"]
+    a = [f"{x:.3f}" for x in (acc[1:]+[0]*4)[:4]]
+    print(f"{tag:>22} {'static':>8} {str(fan):>12} {mn:>3} {d['sigma_mean']:7.3f} "
+          f"{d['mean_tree_width']:6.2f} {d['tree_tok_per_s']:8.2f} {spd:8.3f}  [{', '.join(a)}]")
+    rows.append((tag, "static", fan, mn, d, spd))
+
+for K in (4, 6, 8):
+    for MN in (16, 24, 32):
+        tag = f"dyn_k{K}_n{MN}"
+        fan = [1, K, K, K, K]
+        d = load(tag)
+        spd = d["tree_tok_per_s"] / POOLED_G
+        acc = d["per_position_accept_rate"]
+        a = [f"{x:.3f}" for x in (acc[1:]+[0]*4)[:4]]
+        print(f"{tag:>22} {'dynamic':>8} {str(fan):>12} {MN:>3} {d['sigma_mean']:7.3f} "
+              f"{d['mean_tree_width']:6.2f} {d['tree_tok_per_s']:8.2f} {spd:8.3f}  [{', '.join(a)}]")
+        rows.append((tag, "dynamic", fan, MN, d, spd))
+
+# Champions among dynamic rows only
+dyn = [(t, d, spd) for t, b, f, mn, d, spd in rows if b == "dynamic"]
+sig_champ = max(dyn, key=lambda x: x[1]["sigma_mean"])
+spd_champ = max(dyn, key=lambda x: x[2])
+print(f"\nσ champion (dyn): {sig_champ[0]} σ={sig_champ[1]['sigma_mean']:.3f} "
+      f"(vs anchor 2.739, 0.5% band={0.005*SIG_ANCHOR:.4f})")
+print(f"speed champion (dyn): {spd_champ[0]} spd={spd_champ[2]:.3f}× "
+      f"(vs anchor 1.665, 1% band={0.01*SPD_ANCHOR:.4f})")
+
+# Paired diffs vs static anchors on same 300 prompts
+def paired_mean_se(tag_a, tag_b, key):
+    a, b = load(tag_a)["per_prompt_results"], load(tag_b)["per_prompt_results"]
+    diffs = [x[key] - y[key] for x, y in zip(a, b)]
+    m = statistics.mean(diffs)
+    se = statistics.stdev(diffs) / math.sqrt(len(diffs))
+    return m, se
+
+print("\nPaired vs static anchors (dyn − static), mean ± SE:")
+for t, d, spd in dyn:
+    # pick closer static shape: d3 if k small / narrow else 6432 — report both vs both anchors
+    for anch in ("anchor_static_c1_d3", "anchor_static_c1_6432"):
+        m, se = paired_mean_se(t, anch, "sigma")
+        print(f"  {t} − {anch}: Δσ={m:+.4f} ± {se:.4f}")
+
+# Persist summary
+summary = {
+    "pooled_greedy": POOLED_G,
+    "sigma_anchor_300": SIG_ANCHOR,
+    "speed_anchor_300": SPD_ANCHOR,
+    "anchor_ok": True,
+    "rows": [
+        {"tag": t, "builder": b, "fanout": f, "max_nodes": mn,
+         "sigma": d["sigma_mean"], "Nbar": d["mean_tree_width"],
+         "tree_tok_per_s": d["tree_tok_per_s"], "speed_pooled": spd}
+        for t, b, f, mn, d, spd in rows
+    ],
+    "sigma_champion": sig_champ[0],
+    "speed_champion": spd_champ[0],
+}
+json.dump(summary, open(out / "sweep_summary.json", "w"), indent=2)
+print(f"\nwrote {out / 'sweep_summary.json'}")
+print("SWEEP COMPLETE — anchors PASS")
+EOF
+echo "=== DONE $(date) ==="

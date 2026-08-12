@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=64GB
+#PBS -l walltime=00:40:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N eval_foldbonus_ab
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/medusa_outputs/eval_foldbonus_ab.log
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_v1_full
+echo "================================================================"
+echo "FOLD-BONUS A/B (3c): gather baseline vs folded vs greedy, 20 prompts"
+echo "host: $(hostname)   date: $(date)   job: ${PBS_JOBID:-N/A}"
+echo "================================================================"
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+echo ""; echo "### CI sanity: regression (fanout=[1,1,1] tree == chain) ###"
+python3 -u -m scripts.eval_acceptance_tree \
+  --mode regression --fanout 1 1 1 --max-nodes 8 --n-prompts 5 --max-new-tokens 80 \
+  --out ${OUT}/eval_tree_regression_ci.json || { echo "REGRESSION GATE FAILED"; exit 1; }
+
+echo ""; echo "### wide-tree gather cache consistency (stepwise argmax) ###"
+python3 -u -m scripts.eval_acceptance_tree \
+  --mode validate_reorg --fanout 4 3 2 --max-nodes 16 --n-prompts 3 --max-new-tokens 60 \
+  --out ${OUT}/eval_tree_validate_reorg.json || echo "WARN: validate_reorg flagged (see log)"
+
+echo ""; echo "### A/B decision ###"
+python3 -u -m scripts.eval_acceptance_tree \
+  --mode foldbonus_ab --fanout 4 3 2 --max-nodes 16 --n-prompts 20 --max-new-tokens 150 \
+  --out ${OUT}/eval_foldbonus_ab.json
+echo "EXIT_CODE=$?"
+echo "DONE $(date)"

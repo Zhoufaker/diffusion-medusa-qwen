@@ -1,0 +1,53 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=03:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N phaseA_eval
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Phase A Step 4: live eval of the general-domain heads on the SAME 100 prompts,
+# chain + baseline tree + folded, v1-identical settings. Compare against
+# chart-trained v1: chain 1.95 / tree 2.405 / folded 1.485 / accept [0.871,0.384,0.117].
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+CKPT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_phaseA_general/ckpt_best.pt
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_phaseA_general
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+
+echo "=== Phase A eval  host:$(hostname)  date:$(date)  job:${PBS_JOBID:-N/A} ==="
+echo "CKPT=$CKPT"
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+echo ""; echo "############ 1/3  CHAIN (canonical sigma; eval_acceptance.py) ############"
+python3 -u -m scripts.eval_acceptance \
+    --ckpt "$CKPT" --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --out "$OUT/eval_acceptance_phaseA_fp16.json" \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42
+
+echo ""; echo "############ 2/3  BASELINE TREE (+greedy/chain tok/s) ############"
+python3 -u -m scripts.eval_acceptance_tree \
+    --mode tree --reorg gather --fanout 4 3 2 --max-nodes 16 \
+    --ckpt "$CKPT" --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+    --measure-greedy --measure-chain \
+    --out "$OUT/eval_acceptance_tree_phaseA_fp16.json"
+
+echo ""; echo "############ 3/3  FOLDED (speed-optimized path) ############"
+python3 -u -m scripts.eval_acceptance_tree \
+    --mode tree --fold-bonus --reorg gather --fanout 4 3 2 --max-nodes 16 \
+    --ckpt "$CKPT" --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+    --measure-greedy \
+    --out "$OUT/eval_acceptance_folded_phaseA_fp16.json"
+
+echo ""; echo "=== DONE $(date) ==="

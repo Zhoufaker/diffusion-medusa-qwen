@@ -1,0 +1,48 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ngpus=1,ncpus=16,mem=120GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N c1_train
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# C1 FULL — offline eagle_cond fine-tune, 1 epoch on llava_general_35k.
+# Warm-start B2; bonus_proj zero-init; cond=tokens[t], target unchanged.
+# Param groups: heads lr=1e-4, bonus_proj lr=5e-4 (locked).
+# Queue: dgxa100 (V100 peak OOMs at AdamW8bit first-step state init even with
+# CPU-resident embed; A100 80GB prioritized for convergence).
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+BASE_SNAP=/scratch/li96/mz9869/tmp_hf_download/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5
+
+echo "=== C1 TRAIN $(hostname) $(date) job=${PBS_JOBID:-unset} ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+python -u -m scripts.train --config config/linked_medusa_default.yaml --override \
+    dataset.kind=cached \
+    dataset.cache_dir=/scratch/li96/mz9869/cached_data/llava_general_35k \
+    dataset.eval_split=last_1000 \
+    model.num_heads=5 \
+    model.init_lm_head_from_base=false \
+    model.eagle_cond=true \
+    model.base_model_id=$BASE_SNAP \
+    model.warm_start_from=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2/ckpt_best.pt \
+    training.lr=1e-4 \
+    training.total_steps=8500 \
+    "training.loss_weights=[1.0,0.8,0.64,0.512,0.41]" \
+    logging.log_every=50 \
+    logging.eval_every=500 \
+    logging.save_every=1000 \
+    logging.output_dir=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+
+echo "=== DONE $(date) ==="

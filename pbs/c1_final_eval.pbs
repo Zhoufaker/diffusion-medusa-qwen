@@ -1,0 +1,88 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N c1_final
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# C1 FINAL EVAL — eval-100, same V100 run, per-config greedy.
+# C1 x3 (d2/d3/wide) + B2 x3 regression controls (σ must match 2.027/2.093/2.309).
+# Truncation + skip_head0_lm_head + cond_embed all active on folded path.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+# base load offline env also set inside scripts/eval_acceptance_tree.py (HF_HOME default)
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+B2=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2
+OUT=$C1/final_eval
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy \
+        --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== C1 FINAL $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+run () { local tag=$1 ckpt=$2; shift 2
+    echo ""; echo "######## $tag ########"
+    python3 -u -m scripts.eval_acceptance_tree $COMMON --ckpt "$ckpt" "$@" \
+        --out "$OUT/$tag.json"
+}
+
+run c1_d2   "$C1/ckpt_best.pt" --fanout 1 3 2 0 0 --max-nodes 16
+run c1_d3   "$C1/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16
+run c1_wide "$C1/ckpt_best.pt" --fanout 1 6 4 2 1 --max-nodes 24
+run b2_d2   "$B2/ckpt_best.pt" --fanout 1 3 2 0 0 --max-nodes 16
+run b2_d3   "$B2/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16
+run b2_wide "$B2/ckpt_best.pt" --fanout 1 6 4 2 1 --max-nodes 24
+
+echo ""; echo "=== FINAL TABLE ==="
+python3 - << 'EOF'
+import json, sys
+out = "/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/final_eval/"
+rows = [("C1 [.,3,2]x16",     "c1_d2"),
+        ("C1 [.,3,2,1]x16",   "c1_d3"),
+        ("C1 [.,6,4,2,1]x24", "c1_wide"),
+        ("B2 [.,3,2]x16 ctrl", "b2_d2"),
+        ("B2 [.,3,2,1]x16",   "b2_d3"),
+        ("B2 [.,6,4,2,1]x24", "b2_wide")]
+print(f"{'config':>22} {'sigma':>6} {'N_bar':>6} {'tree t/s':>8} {'greedy':>7} {'speedup':>7}  accept[1..]")
+for name, f in rows:
+    d = json.load(open(out + f + ".json"))
+    acc = " ".join(f"{x:.3f}" for x in d["per_position_accept_rate"][1:])
+    print(f"{name:>22} {d['sigma_mean']:>6.3f} {d['mean_tree_width']:>6.2f} "
+          f"{d['tree_tok_per_s']:>8.2f} {d['greedy_tok_per_s']:>7.2f} "
+          f"{d['net_speedup_vs_greedy']:>7.3f}  [{acc}]")
+print()
+b2 = {k: json.load(open(out + k + ".json"))["sigma_mean"]
+      for k in ("b2_d2", "b2_d3", "b2_wide")}
+exp = {"b2_d2": 2.027, "b2_d3": 2.093, "b2_wide": 2.309}
+print("B2 regression gate:")
+gate_ok = True
+for k, v in exp.items():
+    ok = abs(b2[k] - v) < 0.0005
+    print(f"  {k}: got {b2[k]:.3f} expect {v:.3f}  {'OK' if ok else 'FAIL'}")
+    gate_ok &= ok
+print(f"B2 gate PASS: {gate_ok}")
+# bonus_proj norm from C1 ckpt
+import torch
+sd = torch.load(out.replace("final_eval/", "") + "ckpt_best.pt",
+                map_location="cpu", weights_only=False)
+w = sd["model"]["bonus_proj.weight"].float()
+print(f"bonus_proj.weight Frobenius norm (post-train) = {w.norm().item():.6f}")
+sys.exit(0 if gate_ok else 1)
+EOF
+echo "=== DONE $(date) ==="

@@ -1,0 +1,51 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=10:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N r6_reprobe
+#PBS -j oe
+
+# Round-6: candidate-specific re-probe of 512 recorded near_ties (V100).
+# Required env (fail-fast): see RERUN.md / B_layer RERUN.md.
+
+set -euo pipefail
+
+# Log destination is supplied by the submitter (qsub -o "$MEDUSA_LOG_DIR");
+# no #PBS -o here, so the script carries no site-specific log path.
+: "${MEDUSA_LOG_DIR:?set MEDUSA_LOG_DIR and pass it to qsub -o}"
+: "${MEDUSA_PROJECT_ROOT:?set MEDUSA_PROJECT_ROOT}"
+: "${MEDUSA_VENV:?set MEDUSA_VENV}"
+: "${HF_HOME:?set HF_HOME}"
+: "${MEDUSA_MANIFEST100:?set MEDUSA_MANIFEST100}"
+: "${MEDUSA_MANIFEST300:?set MEDUSA_MANIFEST300}"
+: "${MEDUSA_MANIFEST_OOD:?set MEDUSA_MANIFEST_OOD}"
+: "${MEDUSA_IMAGES:?set MEDUSA_IMAGES}"
+: "${MEDUSA_IMAGES_OOD:?set MEDUSA_IMAGES_OOD}"
+: "${MEDUSA_REPORTS_DIR:?set MEDUSA_REPORTS_DIR (o0_report dir)}"
+: "${MEDUSA_OUT:?set MEDUSA_OUT}"
+
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
+echo "=== ROUND6 CANDIDATE REPROBE $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${MEDUSA_VENV}/bin/activate"
+cd "${MEDUSA_PROJECT_ROOT}"
+mkdir -p "${MEDUSA_OUT}"
+
+python -m pytest tests/test_o0_and_ordered.py -q --tb=line -k 'candidate or near_tie or classify'
+
+python3 -u -m scripts.reprobe_near_tie_candidate \
+  --reports-dir "${MEDUSA_REPORTS_DIR}" \
+  --out-dir "${MEDUSA_OUT}" \
+  --manifest-100 "${MEDUSA_MANIFEST100}" \
+  --manifest-300 "${MEDUSA_MANIFEST300}" \
+  --manifest-ood "${MEDUSA_MANIFEST_OOD}" \
+  --images "${MEDUSA_IMAGES}" \
+  --images-ood "${MEDUSA_IMAGES_OOD}"
+
+echo "=== REPROBE DONE $(date) ==="
+ls -la "${MEDUSA_OUT}"

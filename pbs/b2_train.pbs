@@ -1,0 +1,49 @@
+#!/bin/bash
+#PBS -N b2_train
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l ncpus=16
+#PBS -l mem=120GB
+#PBS -l ngpus=1
+#PBS -l walltime=14:00:00
+#PBS -l wd
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B2 FULL on-policy fine-tune. Warm-start from B1; loss identical to B1 (CE vs
+# base argmax at each offset); only the input hidden distribution changes
+# (live folded-rollout anchors). Backward per round (memory design in
+# scripts/train_onpolicy.py); grad accumulation at ROUND granularity:
+# 1500 steps x 256 rounds ~= 384k rounds ~= 6000 prompts. lr 1e-4 cosine (one
+# notch below B1's 5e-4 — fine-tune), val-sigma plateau monitored every 200
+# steps on the reserved rollout-pool slice; best-by-val-sigma kept.
+# ckpt -> linked_medusa_5head_b2/ (B1 untouched).
+# Budget sized from smoke v2: ~36.6 rounds/prompt (EOS-early-stop; rollout
+# sigma~3.0 on the wide train tree), so the planned ~6000-prompt budget is
+# ~220k rounds = ~860 steps @ round_accum 256. Smoke rate ~0.23 prompt/s
+# -> 900 steps ~ 8-11h; walltime 14h covers val/ckpt overhead.
+# Override budget: qsub -v TOTAL_STEPS=...
+
+set -euo pipefail
+echo "=== JOB $(hostname) $(date) job=${PBS_JOBID:-unset} ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+TOTAL_STEPS=${TOTAL_STEPS:-900}
+
+python -u -m scripts.train_onpolicy \
+    --total-steps "$TOTAL_STEPS" \
+    --round-accum 256 \
+    --lr 1e-4 \
+    --warmup-steps 50 \
+    --log-every 10 \
+    --val-every 200 \
+    --ckpt-every 200 \
+    --val-prompts 25 \
+    --out-dir /scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2
+
+echo "=== DONE $(date) ==="

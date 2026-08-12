@@ -1,0 +1,15 @@
+device          = cpu
+hidden_dim      = 3584
+num_heads       = 3
+num_blocks      = 2
+expansion       = 2
+effective_vocab = 151936
+batch_size      = 2
+seq_len_range   = (50, 64)
+loss_weights    = [1.0, 0.8, 0.64]
+lm_head_path    = /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+
+Loading base lm_head from disk...
+  shape = (152064, 3584), dtype = torch.float16
+
+[33m=== A1: forward produces correct shapes ===[0m

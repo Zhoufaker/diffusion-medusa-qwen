@@ -1,0 +1,32 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=03:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N clean_greedy300
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Clean greedy for speed_300. Acceptance gates locked in
+# scripts/clean_greedy_speed300.py (old100 ∈ 30.3±3%; tree numerators from
+# 174124013; pooled vs per-config; champion=pooled). Any gate fail ⇒ exit 2.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+
+echo "=== CLEAN GREEDY 300 (gated) $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p /scratch/li96/mz9869/logs \
+  /scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/bridge_300
+
+python3 -u -m scripts.clean_greedy_speed300
+echo "=== DONE $(date) ==="

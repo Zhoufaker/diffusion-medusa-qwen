@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -N genA_full
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=06:00:00
+#PBS -l wd
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -r y
+#PBS -J 0-7
+
+# Phase A FULL cache generation, sharded as a PBS job array.
+# Array size (here 0-15 -> 16 shards) MUST equal NUM_SHARDS below.
+# Shard i handles prompt indices where idx % NUM_SHARDS == i; all shards write
+# distinct <idx>.pt into the SAME --out-dir and skip files that already exist
+# (resumable). Run pbs/gen_cache_manifest after all shards finish.
+
+set -euo pipefail
+
+NUM_SHARDS=8
+SHARD_ID=${PBS_ARRAY_INDEX:-0}
+
+echo "=== genA shard ${SHARD_ID}/${NUM_SHARDS}  $(hostname)  $(date) ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+python -u -m scripts.gen_cache_rollout \
+    --out-dir /scratch/li96/mz9869/cached_data/llava_general_35k \
+    --max-new 256 \
+    --num-shards "$NUM_SHARDS" \
+    --shard-id "$SHARD_ID"
+
+echo "=== shard ${SHARD_ID} DONE $(date) ==="

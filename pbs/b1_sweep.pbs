@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N b1_sweep
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B1 folded fanout x max_nodes sweep (4 speculative levels, heads 1..4).
+# fanout[0] is a placeholder (folded root is forced); speculative widths are
+# fanout[1..4], front-loaded per review guidance. 20 prompts per config with
+# --measure-greedy for same-run tok/s. V100 = same card as the Phase A anchor.
+# Produces sweep table: fanout x max_nodes -> sigma / tok/s / net-speedup.
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+CKPT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1/ckpt_best.pt
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1
+
+echo "=== B1 SWEEP $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+for FO in "1 6 4 2 1" "1 4 3 2 1" "1 8 4 2 1"; do
+  for MN in 16 24 32; do
+    TAG="fo$(echo $FO | tr -d ' ')_mn${MN}"
+    echo ""; echo "######## folded fanout=[$FO] max_nodes=$MN ########"
+    python3 -u -m scripts.eval_acceptance_tree \
+      --mode tree --fold-bonus --reorg gather \
+      --fanout $FO --max-nodes $MN \
+      --ckpt "$CKPT" \
+      --n-prompts 20 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+      --measure-greedy \
+      --out "$OUT/sweep_${TAG}.json"
+  done
+done
+
+echo ""; echo "=== SWEEP TABLE ==="
+python3 - << 'EOF'
+import json, glob
+rows = []
+for f in sorted(glob.glob("/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1/sweep_*.json")):
+    d = json.load(open(f))
+    rows.append((d["fanout"], d["max_nodes"], d["sigma_mean"], d["mean_tree_width"],
+                 d["tree_tok_per_s"], d["greedy_tok_per_s"], d["net_speedup_vs_greedy"],
+                 d["per_position_accept_rate"]))
+rows.sort(key=lambda r: -(r[6] or 0))
+print(f"{'fanout':>16} {'mN':>3} {'sigma':>6} {'N_bar':>6} {'tree t/s':>8} {'greedy':>7} {'speedup':>7}  accept[1..4]")
+for fo, mn, sg, nb, ts, gs, sp, ppa in rows:
+    acc = " ".join(f"{x:.3f}" for x in ppa[1:])
+    print(f"{str(fo):>16} {mn:>3} {sg:>6.3f} {nb:>6.2f} {ts:>8.2f} {gs:>7.2f} {sp:>7.3f}  [{acc}]")
+print("\nBEST (by net speedup):", rows[0][0], "max_nodes", rows[0][1])
+EOF
+echo "=== DONE $(date) ==="

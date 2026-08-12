@@ -1,0 +1,50 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ngpus=1,ncpus=16,mem=120GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N c1_smoke_nc
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# C1 CONTROL smoke — identical to G3 except cond_embed=None (eagle_cond off).
+# Same 300 cache / seed 42 / 200 steps / hyperparams; head_1 uses legacy path.
+# Compare head_1 trajectory vs cond版 (G3: @0=1.540, @200=0.440) to attribute
+# the drop to conditioning vs 300-sample memorization. Do NOT submit full train.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+echo "=== C1 CONTROL SMOKE (no cond) $(hostname) $(date) job=${PBS_JOBID:-unset} ==="
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+python -u -m scripts.train --config config/linked_medusa_default.yaml --override \
+    dataset.kind=cached \
+    dataset.cache_dir=/scratch/li96/mz9869/cached_data/llava_general_35k \
+    dataset.eval_split=null \
+    dataset.val_fraction=0 \
+    dataset.max_samples=300 \
+    model.num_heads=5 \
+    model.init_lm_head_from_base=false \
+    model.eagle_cond=false \
+    model.warm_start_from=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2/ckpt_best.pt \
+    training.lr=1e-4 \
+    training.total_steps=200 \
+    "training.loss_weights=[1.0,0.8,0.64,0.512,0.41]" \
+    logging.log_every=10 \
+    logging.eval_every=0 \
+    logging.save_every=0 \
+    logging.output_dir=/scratch/li96/mz9869/medusa_outputs/c1_smoke_nocond
+
+echo ""
+echo "=== CONTROL head_1 trace ==="
+grep -E "head_1_loss|^\[step" /scratch/li96/mz9869/logs/${PBS_JOBID}.gadi-pbs.OU 2>/dev/null | head -30 || true
+echo "=== DONE $(date) ==="

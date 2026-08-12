@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "medusa-qwen"
+version = "0.5.0"
+description = "Linked Medusa speculative decoding for Qwen2.5-VL"
+readme = "RERUN.md"
+requires-python = ">=3.11"
+dependencies = [
+  "torch==2.5.1",
+  "transformers==5.3.0",
+  "accelerate==1.13.0",
+  "pillow>=10.0",
+  "numpy>=1.26",
+  "pytest>=8.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["decode*", "model*", "scripts*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

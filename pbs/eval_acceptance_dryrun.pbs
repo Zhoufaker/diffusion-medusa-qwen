@@ -1,0 +1,40 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=64GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N linked_medusa_eval_dryrun
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/medusa_outputs/linked_medusa_v1_full/eval_dryrun.pbs.log
+
+set -euo pipefail
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+OUT_DIR="/scratch/li96/mz9869/medusa_outputs/linked_medusa_v1_full"
+
+echo "================================================================"
+echo "Linked Medusa σ DRY-RUN (5 prompts, max_new=30, V100)"
+echo "================================================================"
+echo "host:        $(hostname)"
+echo "date:        $(date)"
+echo "PBS_JOBID:   ${PBS_JOBID:-N/A}"
+echo "================================================================"
+
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+
+echo "[env] python3: $(which python3)"
+echo "[env] torch:   $(python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available())')"
+nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version --format=csv
+
+mkdir -p "${OUT_DIR}"
+
+cd "${PROJECT_ROOT}"
+python3 -u -m scripts.eval_acceptance --dry-run
+
+echo "================================================================"
+echo "DONE at $(date)"
+echo "================================================================"

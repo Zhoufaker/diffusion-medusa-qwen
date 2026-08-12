@@ -1,0 +1,61 @@
+device          = cpu
+hidden_dim      = 3584
+num_heads       = 3
+num_blocks      = 2
+expansion       = 2
+effective_vocab = 151936
+batch_size      = 4
+seq_len_range   = (50, 64)
+loss_weights    = [1.0, 0.8, 0.64]
+c2_tol_abs      = 0.001
+c3_l2_threshold = 1e-06
+c4 stress       = batch=4, seq=64
+c5_tol_abs      = 0.0
+lm_head_path    = /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+
+[tiny] CPU smoke mode: tiny dimensions + random base lm_head
+  shape = (512, 128), dtype = torch.float16  (synthetic)
+
+[33m=== C1: forward produces correct shapes ===[0m
+[2m[info][0m vocab_size = 512    B=4, L=62
+[2m[info][0m head_0 shape: (4, 62, 512)
+[2m[info][0m head_1 shape: (4, 62, 512)
+[2m[info][0m head_2 shape: (4, 62, 512)
+[32m[PASS][0m all 3 heads emit shape (B, L, 512)
+
+[33m=== C2: identity init — head_0 logits ≈ base_lm_head @ h_t   (tol < 1e-3) ===[0m
+[2m[info][0m head_0 logits range: max|expected| = 1.001e+00    max|abs diff| = 0.000e+00    max relative diff = 0.000e+00
+[32m[PASS][0m max |abs diff| = 0.000e+00  ≤  tol 1.000e-03
+
+[33m=== C3: chain connectivity — total_loss=loss_2; ||head_0 grads||_2 > 1e-6 ===[0m
+[2m[info][0m head_2_loss        = 6.4798
+[2m[info][0m #head_0 params     = 19   (non-zero grad: 6, zero grad: 13, no-grad: 0)
+[2m[info][0m ||grad||_2  (head_0 input_resblock + body) = 1.408e-01
+[2m[info][0m ||grad||_2  (head_0 lm_head)               = 0.000e+00     ← may legitimately be 0: lm_head only feeds loss_0 (weight=0); chain passes pre-lm_head h')
+[2m[info][0m ||grad||_2  (head_0 ALL params, aggregate) = 1.408e-01   ← the C3 number
+[32m[PASS][0m ||head_0 grads||_2 = 1.408e-01  >  threshold 1e-06
+
+[33m=== C4: fwd+bwd+opt-step  batch=4, seq=64  — peak memory ===[0m
+[2m[info][0m peak_GPU_memory = N/A (CPU run; OOM-check is GPU-only meaningful)
+[2m[info][0m total_loss after step = 15.4736
+[32m[PASS][0m one full step at B=4, L=64 completed (CPU)
+
+[33m=== C5: determinism — same batch → identical logits across two forwards ===[0m
+[2m[info][0m head_0 max |abs diff| between runs = 0.000e+00
+[2m[info][0m head_1 max |abs diff| between runs = 0.000e+00
+[2m[info][0m head_2 max |abs diff| between runs = 0.000e+00
+[32m[PASS][0m two forwards bit-exact identical (max |diff| = 0)
+
+[33m=== A6 (bonus): per-head grad norms with default loss weights, NaN/Inf scan ===[0m
+[2m[info][0m per-head ||grad||_2: head_0=8.017e-01, head_1=1.257e+00, head_2=1.518e+00
+[2m[info][0m NaN tensors = 0    Inf tensors = 0
+[32m[PASS][0m gradient norms finite, no NaN/Inf
+
+[33m=== SUMMARY (C1..C5 — these are the formal must-pass checks) ===[0m
+  C1: [32mPASS[0m
+  C2: [32mPASS[0m
+  C3: [32mPASS[0m
+  C4: [32mPASS[0m
+  C5: [32mPASS[0m
+
+[32mPhase A (C1..C5) overall: PASS[0m

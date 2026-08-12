@@ -1,0 +1,21 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=64GB
+#PBS -l walltime=00:20:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N diag_kernel_argmax
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/medusa_outputs/diag_kernel_argmax.log
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+echo "host: $(hostname)  date: $(date)  job: ${PBS_JOBID:-N/A}"
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+python3 -u -m scripts.diag_kernel_argmax
+echo "EXIT_CODE=$?"
+echo "DONE $(date)"

@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N dyn_k10_12
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Optional cand_k ceiling probe: dyn_k10_n32 + dyn_k12_n32 (300-scale, same protocol).
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/dynamic_sweep_300
+MANIFEST=/scratch/li96/mz9869/eval_manifests/manifest_300.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+POOLED_G=29.917703129942712
+
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 300 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --ordered-manifest --tree-builder dynamic \
+        --ckpt $C1/ckpt_best.pt --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== DYN k10/k12 n32 $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+  --fanout 1 10 10 10 10 --max-nodes 32 --out "$OUT/dyn_k10_n32.json"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+  --fanout 1 12 12 12 12 --max-nodes 32 --out "$OUT/dyn_k12_n32.json"
+
+python3 - <<EOF
+import json
+from pathlib import Path
+out=Path("$OUT")
+G=$POOLED_G
+for tag in ("dyn_k10_n32","dyn_k12_n32","dyn_k8_n32"):
+    p=out/f"{tag}.json"
+    if not p.exists():
+        print(tag, "MISSING"); continue
+    d=json.load(open(p))
+    print(f"{tag}: σ={d['sigma_mean']:.3f} N̄={d['mean_tree_width']:.2f} "
+          f"tree={d['tree_tok_per_s']:.2f} spd={d['tree_tok_per_s']/G:.3f}")
+EOF
+echo "=== DONE $(date) ==="

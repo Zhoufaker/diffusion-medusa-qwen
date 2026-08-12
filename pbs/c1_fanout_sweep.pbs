@@ -1,0 +1,141 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=06:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N c1_fanout
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# C1 fanout re-sweep (eval-only). C1 ckpt, truncation+skip_head0 on,
+# same 100 prompts / seed 42 as 173623490. Anchor rows are regression gates.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/fanout_sweep
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy \
+        --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== C1 FANOUT SWEEP $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+# NOTE row 11: ckpt has 5 heads only — original [·,6,4,2,1,1]×32 replaced by
+# [·,5,4,2,1]×24 (documented in table footer).
+
+run () {
+    local tag=$1; shift
+    echo ""; echo "######## $tag  $* ########"
+    python3 -u -m scripts.eval_acceptance_tree $COMMON \
+        --ckpt "$C1/ckpt_best.pt" "$@" --out "$OUT/$tag.json"
+}
+
+run a1_d2_16     --fanout 1 3 2 0 0 --max-nodes 16
+run a2_d3_16     --fanout 1 3 2 1 0 --max-nodes 16
+run a3_wide_24   --fanout 1 6 4 2 1 --max-nodes 24
+run b4_421_24    --fanout 1 4 2 1 0 --max-nodes 24
+run b5_431_24    --fanout 1 4 3 1 0 --max-nodes 24
+run b6_531_24    --fanout 1 5 3 1 0 --max-nodes 24
+run b7_432_24    --fanout 1 4 3 2 0 --max-nodes 24
+run c8_wide_32   --fanout 1 6 4 2 1 --max-nodes 32
+run c9_8421_32   --fanout 1 8 4 2 1 --max-nodes 32
+run c10_6432_32  --fanout 1 6 4 3 2 --max-nodes 32
+run d11_5421_24  --fanout 1 5 4 2 1 --max-nodes 24
+run d12_3211_20  --fanout 1 3 2 1 1 --max-nodes 20
+
+echo ""; echo "=== FANOUT SWEEP TABLE ==="
+python3 - << 'EOF'
+import json, math
+out = "/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/fanout_sweep/"
+
+def full_tree_nodes(fanout):
+    """Folded full tree size before prune (trailing zero fanouts ignored)."""
+    f = list(fanout)
+    while len(f) > 1 and f[-1] == 0:
+        f.pop()
+    n = 1  # root
+    width = 1
+    for k in range(1, len(f)):
+        width *= f[k]
+        n += width
+    return n
+
+rows = [
+    ("1 anchor [.,3,2]x16",       "a1_d2_16",    [1,3,2,0,0], 16, 2.207, True),
+    ("2 anchor [.,3,2,1]x16",     "a2_d3_16",    [1,3,2,1,0], 16, 2.370, True),
+    ("3 anchor [.,6,4,2,1]x24",   "a3_wide_24",  [1,6,4,2,1], 24, 2.619, True),
+    ("4 [.,4,2,1]x24",            "b4_421_24",   [1,4,2,1,0], 24, None, False),
+    ("5 [.,4,3,1]x24",            "b5_431_24",   [1,4,3,1,0], 24, None, False),
+    ("6 [.,5,3,1]x24",            "b6_531_24",   [1,5,3,1,0], 24, None, False),
+    ("7 [.,4,3,2]x24",            "b7_432_24",   [1,4,3,2,0], 24, None, False),
+    ("8 [.,6,4,2,1]x32",          "c8_wide_32",  [1,6,4,2,1], 32, None, False),
+    ("9 [.,8,4,2,1]x32",          "c9_8421_32",  [1,8,4,2,1], 32, None, False),
+    ("10 [.,6,4,3,2]x32",         "c10_6432_32", [1,6,4,3,2], 32, None, False),
+    ("11 [.,5,4,2,1]x24 REPL",    "d11_5421_24", [1,5,4,2,1], 24, None, False),
+    ("12 [.,3,2,1,1]x20",         "d12_3211_20", [1,3,2,1,1], 20, None, False),
+]
+
+print(f"{'config':>28} {'sigma':>6} {'N_bar':>6} {'fullN':>5} {'prune':>5} "
+      f"{'tree t/s':>8} {'greedy':>7} {'speedup':>7}  accept[1..]  notes")
+gate_ok = True
+for name, tag, fan, mn, gate_s, is_anchor in rows:
+    d = json.load(open(out + tag + ".json"))
+    full = full_tree_nodes(fan)
+    # prune triggered if mean width meaningfully below full OR full > max_nodes
+    # (floor can also push N > max_nodes — still "prune path" active when full > mn)
+    pruned = full > mn or abs(d["mean_tree_width"] - full) > 0.05
+    acc = " ".join(f"{x:.3f}" for x in d["per_position_accept_rate"][1:])
+    notes = []
+    if is_anchor:
+        ok = abs(d["sigma_mean"] - gate_s) < 0.0005
+        notes.append(f"GATE σ={gate_s:.3f} {'OK' if ok else 'FAIL'}")
+        gate_ok &= ok
+    if (not is_anchor) and gate_s is None:
+        # flag if sigma below nearest shallower anchor of same depth family — report only
+        pass
+    print(f"{name:>28} {d['sigma_mean']:>6.3f} {d['mean_tree_width']:>6.2f} "
+          f"{full:>5d} {'Y' if pruned else 'N':>5} "
+          f"{d['tree_tok_per_s']:>8.2f} {d['greedy_tok_per_s']:>7.2f} "
+          f"{d['net_speedup_vs_greedy']:>7.3f}  [{acc}]  {' | '.join(notes)}")
+
+# sigma-drop vs anchors (report-only)
+print()
+print("Sigma vs anchors (report-only; widen/deepen should not drop σ):")
+anchors = {
+    "d2": ("a1_d2_16", 2.207),
+    "d3": ("a2_d3_16", 2.370),
+    "wide24": ("a3_wide_24", 2.619),
+}
+checks = [
+    ("b4_421_24", "d3"), ("b5_431_24", "d3"), ("b6_531_24", "d3"), ("b7_432_24", "d3"),
+    ("c8_wide_32", "wide24"), ("c9_8421_32", "wide24"), ("c10_6432_32", "wide24"),
+    ("d11_5421_24", "wide24"), ("d12_3211_20", "d3"),
+]
+for tag, fam in checks:
+    d = json.load(open(out + tag + ".json"))
+    _, a_s = anchors[fam]
+    flag = "σ_DROP" if d["sigma_mean"] + 1e-9 < a_s else "ok"
+    print(f"  {tag}: σ={d['sigma_mean']:.3f} vs anchor {fam} {a_s:.3f}  [{flag}]")
+
+print()
+print(f"ANCHOR GATE PASS: {gate_ok}")
+print("NOTE: row 11 replaced [.,6,4,2,1,1]x32 → [.,5,4,2,1]x24 (5-head ckpt only)")
+print("Speed champ threshold vs 1.689: <1% (±0.017) => sweet spot unchanged")
+print("σ champ threshold vs 2.619: <0.5% (±0.013) => sweet spot unchanged")
+raise SystemExit(0 if gate_ok else 1)
+EOF
+echo "=== DONE $(date) ==="

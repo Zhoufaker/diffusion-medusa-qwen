@@ -1,0 +1,60 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=03:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N b1_eval
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B1 final eval on the SAME disjoint 100 prompts (same manifest/seed as v1 /
+# Phase A -> apples-to-apples). Chain + baseline tree + folded@best sweep point.
+# Set the best operating point from b1_sweep before submitting:
+#   qsub -v FOLD_FANOUT="1 6 4 2 1",FOLD_MN=24 pbs/b1_eval.pbs
+# V100 = same card as the Phase A anchor tok/s.
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+CKPT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1/ckpt_best.pt
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+
+FOLD_FANOUT=${FOLD_FANOUT:-"1 6 4 2 1"}
+FOLD_MN=${FOLD_MN:-24}
+TREE_FANOUT=${TREE_FANOUT:-"4 3 2 1 1"}
+TREE_MN=${TREE_MN:-24}
+
+echo "=== B1 EVAL $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+echo "folded: fanout=[$FOLD_FANOUT] max_nodes=$FOLD_MN | baseline tree: [$TREE_FANOUT] mn=$TREE_MN"
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+echo ""; echo "############ 1/3  CHAIN (canonical; eval_acceptance.py untouched) ############"
+python3 -u -m scripts.eval_acceptance \
+    --ckpt "$CKPT" --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --out "$OUT/eval_acceptance_b1_fp16.json" \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42
+
+echo ""; echo "############ 2/3  BASELINE TREE 5-head (+greedy/chain tok/s) ############"
+python3 -u -m scripts.eval_acceptance_tree \
+    --mode tree --reorg gather --fanout $TREE_FANOUT --max-nodes $TREE_MN \
+    --ckpt "$CKPT" --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+    --measure-greedy --measure-chain \
+    --out "$OUT/eval_acceptance_tree_b1_fp16.json"
+
+echo ""; echo "############ 3/3  FOLDED @ best sweep point ############"
+python3 -u -m scripts.eval_acceptance_tree \
+    --mode tree --fold-bonus --reorg gather --fanout $FOLD_FANOUT --max-nodes $FOLD_MN \
+    --ckpt "$CKPT" --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+    --measure-greedy \
+    --out "$OUT/eval_acceptance_folded_b1_fp16.json"
+
+echo ""; echo "=== DONE $(date) ==="

@@ -1,0 +1,22 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+[env] HF_HOME              = /scratch/li96/mz9869/tmp_hf_download
+[step] full extraction starting; output -> /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+[full] lm_head.weight -> shard 'model-00005-of-00005.safetensors'
+[full] downloading shard 'model-00005-of-00005.safetensors' (this may take several minutes)
+[full] shard downloaded: /scratch/li96/mz9869/tmp_hf_download/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5/model-00005-of-00005.safetensors  (1.02 GiB)
+[full] opening shard with safe_open and reading lm_head.weight only
+[full] raw shape=(152064, 3584) dtype=torch.bfloat16
+[info] vocab dim = 152064 (effective tokenizer vocab is 151936; the 128 extra rows are padding for hardware alignment and are kept as-is, no truncation)
+[full] converting dtype torch.bfloat16 -> torch.float16 at write time (V100 has no bf16)
+[full] saved -> /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors  (1.02 GiB)
+[full] metadata -> /scratch/li96/mz9869/medusa_assets/base_lm_head_metadata.json
+[cleanup] removing HF cache at /scratch/li96/mz9869/tmp_hf_download
+[cleanup] done
+
+=== SUMMARY ===
+output path   : /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+metadata path : /scratch/li96/mz9869/medusa_assets/base_lm_head_metadata.json
+shape         : (152064, 3584)
+dtype         : torch.float16
+file size     : 1.02 GiB
+vocab_size    : 152064  (effective tokenizer vocab: 151936)

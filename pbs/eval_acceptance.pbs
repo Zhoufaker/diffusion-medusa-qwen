@@ -1,0 +1,51 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ngpus=1,ncpus=16,mem=64GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N linked_medusa_eval_sigma
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/medusa_outputs/linked_medusa_v1_full/eval_acceptance.pbs.log
+
+set -euo pipefail
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+OUT_DIR="/scratch/li96/mz9869/medusa_outputs/linked_medusa_v1_full"
+
+echo "================================================================"
+echo "Linked Medusa σ evaluation (full run, 100 prompts)"
+echo "================================================================"
+echo "host:          $(hostname)"
+echo "date:          $(date)"
+echo "PBS_JOBID:     ${PBS_JOBID:-N/A}"
+echo "PBS_O_WORKDIR: ${PBS_O_WORKDIR:-N/A}"
+echo "PROJECT_ROOT:  ${PROJECT_ROOT}"
+echo "OUT_DIR:       ${OUT_DIR}"
+echo "================================================================"
+
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+
+echo "[env] python3: $(which python3)"
+echo "[env] torch:   $(python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available())')"
+nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version --format=csv
+
+mkdir -p "${OUT_DIR}"
+
+cd "${PROJECT_ROOT}"
+python3 -u -m scripts.eval_acceptance \
+    --ckpt "${OUT_DIR}/ckpt_best.pt" \
+    --manifest /g/data/li96/mz9869/data/llava_subset_2k.json \
+    --images-dir /g/data/li96/mz9869/data/coco_subset \
+    --out "${OUT_DIR}/eval_acceptance_v1_fp16.json" \
+    --n-prompts 100 \
+    --min-ref-words 80 \
+    --max-new-tokens 150 \
+    --seed 42
+
+echo "================================================================"
+echo "DONE at $(date)"
+echo "================================================================"

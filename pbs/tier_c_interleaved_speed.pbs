@@ -1,0 +1,48 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=18:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N tier_c_speed
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Tier C: interleaved e2e speed final under v2_hardcap runner.
+# Same process / model; per-prompt random order of static_d3 / dyn_n24 / greedy;
+# 3 independent blocks; warmup then time. Stop for pre-reg CI read.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/tier_c_interleaved_speed
+MANIFEST300=/scratch/li96/mz9869/eval_manifests/manifest_300.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+
+echo "=== TIER C INTERLEAVED SPEED $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT" /scratch/li96/mz9869/logs
+
+python -m pytest tests/test_max_new_cap.py -q --tb=line
+
+python3 -u -m scripts.tier_c_interleaved_speed \
+  --ckpt $C1/ckpt_best.pt \
+  --manifest $MANIFEST300 \
+  --images-dir $IMAGES \
+  --n-prompts 300 \
+  --min-ref-words 80 \
+  --max-new-tokens 150 \
+  --seed 42 \
+  --n-blocks 3 \
+  --out $OUT/tier_c_summary.json
+
+echo "=== TIER C DONE $(date) ==="
+echo "Read $OUT/tier_c_summary.json — stop for pre-reg CI judgment."

@@ -1,0 +1,37 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=01:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N diag_prefill1m
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Item5 at locked max_pixels=1003520: base-only full 218 + tree-probe on short seqs
+# (longest MM-Vet + head already OOM at 501760; probe mid-seq to estimate head delta).
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/diag_triad
+MAX_PIXELS=1003520
+
+echo "=== DIAG PREFILL max_pixels=${MAX_PIXELS} $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+# tree-probe-top=0: base-only full scan first (answers top3 under locked cap)
+python3 -u scripts/diag_prefill_mem.py \
+  --max-pixels "$MAX_PIXELS" \
+  --tree-probe-top 0 \
+  --out "$OUT/item5_prefill_mem_${MAX_PIXELS}.json"
+echo "EXIT_CODE=$?"
+echo "=== DONE $(date) ==="

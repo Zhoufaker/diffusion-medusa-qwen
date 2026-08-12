@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=06:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N final_eval
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# FINAL EVAL: one run, one V100, eval-100, per-config greedy.
+#   (a) B2 vs B1 folded sigma + per-position accept (preregistered hypothesis:
+#       on-policy gains should concentrate in head_3/head_4)
+#   (b) post-optimization speed table: Phase A / B1 / B2 x narrow(d2,d3)/wide
+#       with BOTH inference optimizations active on the folded path:
+#       head-chain truncation (trailing zero fanouts) + skip_head0_lm_head.
+# REGRESSION GATES (sigma is compute-path-invariant; both opts must not move it):
+#   B1 d2=2.005  d3=2.100  wide=2.307   PhaseA d2=1.943   (accept rates likewise)
+#   tok/s should RISE across the board vs the narrow2 run (head_0 lm_head
+#   GEMV removed: 1/3 of d2 head cost, 1/5 of wide).
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+B1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1
+B2=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2
+PA=/scratch/li96/mz9869/medusa_outputs/linked_medusa_phaseA_general
+OUT=$B2/final_eval
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy \
+        --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== FINAL EVAL $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+run () {  # $1 tag  $2 ckpt  $3.. fanout/max-nodes args
+    local tag=$1 ckpt=$2; shift 2
+    echo ""; echo "######## $tag ########"
+    python3 -u -m scripts.eval_acceptance_tree $COMMON --ckpt "$ckpt" "$@" \
+        --out "$OUT/$tag.json"
+}
+
+run pa_d2   "$PA/ckpt_best.pt" --fanout 1 3 2         --max-nodes 16
+run b1_d2   "$B1/ckpt_best.pt" --fanout 1 3 2 0 0     --max-nodes 16
+run b1_d3   "$B1/ckpt_best.pt" --fanout 1 3 2 1 0     --max-nodes 16
+run b1_wide "$B1/ckpt_best.pt" --fanout 1 6 4 2 1     --max-nodes 24
+run b2_d2   "$B2/ckpt_best.pt" --fanout 1 3 2 0 0     --max-nodes 16
+run b2_d3   "$B2/ckpt_best.pt" --fanout 1 3 2 1 0     --max-nodes 16
+run b2_wide "$B2/ckpt_best.pt" --fanout 1 6 4 2 1     --max-nodes 24
+
+echo ""; echo "=== FINAL TABLE ==="
+python3 - << 'EOF'
+import json
+out = "/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2/final_eval/"
+rows = [("PhaseA [.,3,2]x16",        "pa_d2"),
+        ("B1 [.,3,2]x16",            "b1_d2"),
+        ("B1 [.,3,2,1]x16",          "b1_d3"),
+        ("B1 [.,6,4,2,1]x24",        "b1_wide"),
+        ("B2 [.,3,2]x16",            "b2_d2"),
+        ("B2 [.,3,2,1]x16",          "b2_d3"),
+        ("B2 [.,6,4,2,1]x24",        "b2_wide")]
+print(f"{'config':>22} {'sigma':>6} {'N_bar':>6} {'tree t/s':>8} {'greedy':>7} {'speedup':>7}  accept[1..]")
+for name, f in rows:
+    d = json.load(open(out + f + ".json"))
+    acc = " ".join(f"{x:.3f}" for x in d["per_position_accept_rate"][1:])
+    print(f"{name:>22} {d['sigma_mean']:>6.3f} {d['mean_tree_width']:>6.2f} "
+          f"{d['tree_tok_per_s']:>8.2f} {d['greedy_tok_per_s']:>7.2f} "
+          f"{d['net_speedup_vs_greedy']:>7.3f}  [{acc}]")
+print()
+print("GATES: B1 d2/d3/wide sigma must == 2.005/2.100/2.307, PhaseA == 1.943")
+print("PREREG: B2 vs B1 wide accept — gains should sit in head_3/head_4")
+b1 = json.load(open(out + "b1_wide.json"))["per_position_accept_rate"]
+b2 = json.load(open(out + "b2_wide.json"))["per_position_accept_rate"]
+for k in range(1, len(b1)):
+    print(f"  head_{k}: B1 {b1[k]:.3f} -> B2 {b2[k]:.3f}  ({b2[k]-b1[k]:+.3f})")
+EOF
+echo "=== DONE $(date) ==="

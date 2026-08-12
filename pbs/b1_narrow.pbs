@@ -1,0 +1,71 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N b1_narrow
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B1 narrow-tree add-on (blind-spot fix): the sweep only covered N_bar>=17.
+# Same-run controls: greedy re-measured per config; Phase A folded [.,3,2]x16
+# rerun to cancel run-to-run drift (greedy itself drifts +-3%).
+# Zero-fanout entries truncate deeper heads: [1,3,2,0,0] with the 5-head B1
+# ckpt is node-identical to the 3-head [1,3,2] tree (verified by unit check).
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+B1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1
+PA=/scratch/li96/mz9869/medusa_outputs/linked_medusa_phaseA_general
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy \
+        --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== B1 NARROW $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+echo ""; echo "######## 1/4 B1 narrow depth-2  [.,3,2]x16 (same shape/cost as Phase A folded) ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$B1/ckpt_best.pt" --fanout 1 3 2 0 0 --max-nodes 16 \
+    --out "$B1/eval_folded_narrow_d2.json"
+
+echo ""; echo "######## 2/4 B1 narrow depth-3  [.,3,2,1]x16 ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$B1/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --out "$B1/eval_folded_narrow_d3.json"
+
+echo ""; echo "######## 3/4 B1 narrow depth-4  [.,4,2,1,1]x16 ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$B1/ckpt_best.pt" --fanout 1 4 2 1 1 --max-nodes 16 \
+    --out "$B1/eval_folded_narrow_d4.json"
+
+echo ""; echo "######## 4/4 Phase A folded [.,3,2]x16 SAME-RUN control ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$PA/ckpt_best.pt" --fanout 1 3 2 --max-nodes 16 \
+    --out "$B1/eval_folded_phaseA_control.json"
+
+echo ""; echo "=== NARROW TABLE ==="
+python3 - << 'EOF'
+import json
+base="/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1/"
+rows=[("B1 [.,3,2]x16 (d2)","eval_folded_narrow_d2.json"),
+      ("B1 [.,3,2,1]x16 (d3)","eval_folded_narrow_d3.json"),
+      ("B1 [.,4,2,1,1]x16 (d4)","eval_folded_narrow_d4.json"),
+      ("PhaseA [.,3,2]x16 ctrl","eval_folded_phaseA_control.json")]
+print(f"{'config':>24} {'sigma':>6} {'N_bar':>6} {'tree t/s':>8} {'greedy':>7} {'speedup':>7}  accept[1..]")
+for name,f in rows:
+    d=json.load(open(base+f))
+    acc=" ".join(f"{x:.3f}" for x in d["per_position_accept_rate"][1:])
+    print(f"{name:>24} {d['sigma_mean']:>6.3f} {d['mean_tree_width']:>6.2f} "
+          f"{d['tree_tok_per_s']:>8.2f} {d['greedy_tok_per_s']:>7.2f} "
+          f"{d['net_speedup_vs_greedy']:>7.3f}  [{acc}]")
+EOF
+echo "=== DONE $(date) ==="

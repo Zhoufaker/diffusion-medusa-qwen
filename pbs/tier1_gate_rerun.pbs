@@ -1,0 +1,190 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=08:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N tier1_gates
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Tier-1 1b: after static rank-key + cand_k API + GPU sync fixes.
+# Any FAIL → STOP (do not proceed to Tier-2/3).
+# Also remeasure dyn_k8_n24 tree_tok_per_s vs archived (flag if Δ>2%).
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/tier1_gate_rerun
+MANIFEST100=/g/data/li96/mz9869/data/llava_subset_2k.json
+MANIFEST300=/scratch/li96/mz9869/eval_manifests/manifest_300.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+POOLED_G=29.917703129942712
+
+echo "=== TIER1 GATES $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT" /scratch/li96/mz9869/logs
+
+echo ""; echo "######## SYNTHETIC TESTS ########"
+python -m pytest tests/test_dynamic_tree.py tests/test_tree.py -q --tb=line
+
+COMMON100="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy \
+        --ckpt $C1/ckpt_best.pt --manifest $MANIFEST100 --images-dir $IMAGES"
+COMMON300="--mode tree --fold-bonus --reorg gather --n-prompts 300 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --ordered-manifest \
+        --ckpt $C1/ckpt_best.pt --manifest $MANIFEST300 --images-dir $IMAGES"
+
+run () {
+  local tag=$1; shift
+  echo ""; echo "######## $tag  $* ########"
+  python3 -u -m scripts.eval_acceptance_tree "$@" --out "$OUT/$tag.json"
+}
+
+# --- gate#1 / gate#2 (dynamic ≡ old100 archives) ---
+run gate1_d3_dyn --tree-builder dynamic $COMMON100 --fanout 1 3 2 1 0 --max-nodes 16
+run gate2_wide24_dyn --tree-builder dynamic $COMMON100 --fanout 1 6 4 2 1 --max-nodes 24
+
+# --- static re-run of gate shapes (rank-key must not break archives) ---
+run gate1_d3_static --tree-builder static $COMMON100 --fanout 1 3 2 1 0 --max-nodes 16
+run gate2_wide24_static --tree-builder static $COMMON100 --fanout 1 6 4 2 1 --max-nodes 24
+
+# --- bridge_300 first-100 subset (static anchors, per-prompt vs archive) ---
+run bridge100_c1_d3 --tree-builder static $COMMON300 --fanout 1 3 2 1 0 --max-nodes 16
+run bridge100_c1_6432 --tree-builder static $COMMON300 --fanout 1 6 4 3 2 --max-nodes 32
+
+# --- sweep anchors (full 300 static) already covered by bridge100_* as 300;
+#     also dynamic champ speed row for timing ---
+run dyn_k8_n24 --tree-builder dynamic $COMMON300 --fanout 1 8 8 8 8 --max-nodes 24
+run dyn_k8_n32 --tree-builder dynamic $COMMON300 --fanout 1 8 8 8 8 --max-nodes 32
+
+echo ""; echo "=== GATE CHECKER ==="
+python3 - <<'EOF'
+import json, sys
+from pathlib import Path
+
+out = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/tier1_gate_rerun")
+C1 = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle")
+arch_d3_100 = json.load(open(C1 / "final_eval/c1_d3.json"))
+arch_w_100 = json.load(open(C1 / "final_eval/c1_wide.json"))
+arch_d3_300 = json.load(open(C1 / "bridge_300/c1_d3.json"))
+arch_w_300 = json.load(open(C1 / "bridge_300/c1_6432.json"))
+arch_dyn_n24 = json.load(open(C1 / "dynamic_sweep_300/dyn_k8_n24.json"))
+arch_dyn_n32 = json.load(open(C1 / "dynamic_sweep_300/dyn_k8_n32.json"))
+POOLED_G = 29.917703129942712
+
+def load(tag):
+    return json.load(open(out / f"{tag}.json"))
+
+def per_prompt_eq(a, b, label, subset_ids=None):
+    pa, pb = a["per_prompt_results"], b["per_prompt_results"]
+    if subset_ids is not None:
+        idset = set(subset_ids)
+        pa = [x for x in pa if x["id"] in idset]
+        pb = [x for x in pb if x["id"] in idset]
+        # align by id
+        mb = {x["id"]: x for x in pb}
+        paired = []
+        for x in pa:
+            if x["id"] not in mb:
+                return False, f"{label}: missing id {x['id']} in b"
+            y = mb[x["id"]]
+            if (x.get("sigma") != y.get("sigma")
+                    or x.get("mean_width") != y.get("mean_width")
+                    or x.get("emitted_tokens") != y.get("emitted_tokens")):
+                return False, f"{label}: mismatch id={x['id']}"
+        return True, f"{label}: {len(pa)} prompts OK"
+    if len(pa) != len(pb):
+        return False, f"{label}: n={len(pa)} vs {len(pb)}"
+    for i, (x, y) in enumerate(zip(pa, pb)):
+        if (x.get("sigma") != y.get("sigma")
+                or x.get("mean_width") != y.get("mean_width")
+                or x.get("emitted_tokens") != y.get("emitted_tokens")):
+            return False, f"{label}: mismatch i={i} id={x.get('id')}"
+    return True, f"{label}: {len(pa)} prompts OK"
+
+fails = []
+reports = []
+
+# gate#1 dynamic vs final_eval c1_d3
+g1d = load("gate1_d3_dyn")
+ok, msg = per_prompt_eq(g1d, arch_d3_100, "gate#1 dyn≡c1_d3")
+reports.append(msg); fails.append(not ok)
+# also σ display
+if abs(g1d["sigma_mean"] - 2.370) >= 0.0005:
+    fails.append(True); reports.append(f"gate#1 σ={g1d['sigma_mean']} != 2.370")
+
+# gate#2 dynamic vs final_eval c1_wide
+g2d = load("gate2_wide24_dyn")
+ok, msg = per_prompt_eq(g2d, arch_w_100, "gate#2 dyn≡c1_wide")
+reports.append(msg); fails.append(not ok)
+
+# static gate shapes vs same archives
+g1s = load("gate1_d3_static")
+ok, msg = per_prompt_eq(g1s, arch_d3_100, "gate#1 static≡c1_d3")
+reports.append(msg); fails.append(not ok)
+g2s = load("gate2_wide24_static")
+ok, msg = per_prompt_eq(g2s, arch_w_100, "gate#2 static≡c1_wide")
+reports.append(msg); fails.append(not ok)
+
+# bridge 300 full vs archive (static)
+b_d3 = load("bridge100_c1_d3")
+ok, msg = per_prompt_eq(b_d3, arch_d3_300, "bridge300 c1_d3 static≡archive")
+reports.append(msg); fails.append(not ok)
+b_w = load("bridge100_c1_6432")
+ok, msg = per_prompt_eq(b_w, arch_w_300, "bridge300 c1_6432 static≡archive")
+reports.append(msg); fails.append(not ok)
+
+# old100 subset of bridge300 vs final_eval (ids from final_eval)
+old100_ids = [x["id"] for x in arch_d3_100["per_prompt_results"]]
+ok, msg = per_prompt_eq(b_d3, arch_d3_100, "bridge300⊃old100 c1_d3", subset_ids=old100_ids)
+reports.append(msg); fails.append(not ok)
+ok, msg = per_prompt_eq(b_w, arch_w_100, "bridge300⊃old100 c1_wide", subset_ids=old100_ids)
+reports.append(msg); fails.append(not ok)
+
+# dyn sweep anchors: per-prompt vs prior sweep (σ/width; emitted may track)
+dn24 = load("dyn_k8_n24")
+ok, msg = per_prompt_eq(dn24, arch_dyn_n24, "dyn_k8_n24≡sweep archive")
+reports.append(msg); fails.append(not ok)
+dn32 = load("dyn_k8_n32")
+ok, msg = per_prompt_eq(dn32, arch_dyn_n32, "dyn_k8_n32≡sweep archive")
+reports.append(msg); fails.append(not ok)
+
+# timing: dyn_k8_n24 tree_tok_per_s
+old_tps = arch_dyn_n24["tree_tok_per_s"]
+new_tps = dn24["tree_tok_per_s"]
+# archived speed was tree/POOLED; report both
+old_spd = old_tps / POOLED_G if old_tps else None
+new_spd = new_tps / POOLED_G
+rel = abs(new_tps - old_tps) / old_tps if old_tps else float("inf")
+timing_flag = rel > 0.02
+reports.append(
+    f"dyn_k8_n24 tree_tok_per_s: old={old_tps:.4f} new={new_tps:.4f} "
+    f"relΔ={rel:.4%} {'FLAG>2%' if timing_flag else 'OK≤2%'}"
+)
+reports.append(
+    f"dyn_k8_n24 spd_pool: old={old_spd:.4f}x new={new_spd:.4f}x"
+)
+
+print("\n".join(reports))
+summary = {
+    "reports": reports,
+    "any_fail": any(fails),
+    "timing_flag_gt_2pct": timing_flag,
+    "dyn_k8_n24_tree_tok_per_s_old": old_tps,
+    "dyn_k8_n24_tree_tok_per_s_new": new_tps,
+    "dyn_k8_n24_rel_delta": rel,
+}
+json.dump(summary, open(out / "tier1_gate_summary.json", "w"), indent=2)
+print(f"\nOVERALL: {'FAIL' if any(fails) else 'PASS'}  timing_flag={timing_flag}")
+sys.exit(1 if any(fails) else 0)
+EOF
+echo "=== DONE $(date) ==="

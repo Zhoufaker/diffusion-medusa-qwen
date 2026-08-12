@@ -1,0 +1,148 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=10:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N a_batch_501760
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# A-batch: smoke top-3 n_vis @501760 (c1_6432); peak≤29 → pre-authorized full 218.
+# O0: G* archive hard; OOD fingerprint. mini-manifest uses conversations{} (fixed).
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+B2=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2
+OUT=$C1/ood_mmvet_218
+SMOKE=$C1/ood_smoke_501760
+MANIFEST_LLAVA=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES_LLAVA=/g/data/li96/mz9869/data/coco_subset
+MANIFEST_OOD=/scratch/li96/mz9869/ood_eval/mmvet/manifest_mmvet_218.json
+IMAGES_OOD=/scratch/li96/mz9869/ood_eval/mmvet/mm-vet/images
+MAX_PX=501760
+PEAK_LIM=29.0
+
+ARCH_G1=$C1/final_eval/c1_d3.json
+ARCH_G2=$C1/fanout_sweep/c10_6432_32.json
+ARCH_G3=$C1/final_eval/b2_wide.json
+
+echo "=== A BATCH 501760 $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT" "$SMOKE" /scratch/li96/mz9869/logs
+
+echo "=== SMOKE: top-3 n_vis @ max_pixels=$MAX_PX (c1_6432) ==="
+python3 -u -m scripts.build_mmvet_top_nvis \
+  --max-pixels "$MAX_PX" --top-k 3 \
+  --out "$SMOKE/manifest_top3_nvis.json"
+
+python3 -u -m scripts.eval_acceptance_tree \
+  --mode tree --fold-bonus --reorg gather \
+  --n-prompts 3 --min-ref-words 0 --ordered-manifest \
+  --max-new-tokens 150 --seed 42 --measure-greedy \
+  --max-pixels "$MAX_PX" \
+  --ckpt "$C1/ckpt_best.pt" --fanout 1 6 4 3 2 --max-nodes 32 \
+  --manifest "$SMOKE/manifest_top3_nvis.json" \
+  --images-dir "$IMAGES_OOD" \
+  --out "$SMOKE/c1_6432_top3.json"
+
+python3 - <<PY
+import json, sys
+d=json.load(open("$SMOKE/c1_6432_top3.json"))
+peak=d.get("peak_alloc_gib")
+n=d.get("n_prompts")
+print(f"SMOKE n={n} peak_alloc={peak} GiB  lim=$PEAK_LIM")
+if n != 3 or peak is None or peak > $PEAK_LIM:
+    print("SMOKE FAIL — stop; do not launch full A")
+    sys.exit(2)
+print("SMOKE PASS — pre-authorized full A")
+PY
+
+echo "=== FULL A: G1-G3 + OOD 218 @ max_pixels=$MAX_PX ==="
+GATE_COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy --check-greedy-bytes \
+        --manifest $MANIFEST_LLAVA --images-dir $IMAGES_LLAVA"
+OOD_COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 218 --min-ref-words 0 \
+        --max-new-tokens 150 --seed 42 --measure-greedy --ordered-manifest \
+        --check-greedy-bytes --max-pixels $MAX_PX \
+        --manifest $MANIFEST_OOD --images-dir $IMAGES_OOD"
+
+run () {
+    local tag=$1; shift
+    echo ""; echo "######## $tag ########"
+    python3 -u -m scripts.eval_acceptance_tree "$@" --out "$OUT/$tag.json"
+}
+
+run G1_c1_d3   $GATE_COMMON --ckpt "$C1/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --o0-archive "$ARCH_G1"
+run G2_c1_6432 $GATE_COMMON --ckpt "$C1/ckpt_best.pt" --fanout 1 6 4 3 2 --max-nodes 32 \
+    --o0-archive "$ARCH_G2"
+run G3_b2_wide $GATE_COMMON --ckpt "$B2/ckpt_best.pt" --fanout 1 6 4 2 1 --max-nodes 24 \
+    --o0-archive "$ARCH_G3"
+
+run O1_c1_d3   $OOD_COMMON --ckpt "$C1/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --o0-write-archive "$OUT/O1_c1_d3.o0_archive.json"
+run O2_c1_6432 $OOD_COMMON --ckpt "$C1/ckpt_best.pt" --fanout 1 6 4 3 2 --max-nodes 32 \
+    --o0-write-archive "$OUT/O2_c1_6432.o0_archive.json"
+run O3_b2_d3   $OOD_COMMON --ckpt "$B2/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --o0-write-archive "$OUT/O3_b2_d3.o0_archive.json"
+run O4_b2_6432 $OOD_COMMON --ckpt "$B2/ckpt_best.pt" --fanout 1 6 4 3 2 --max-nodes 32 \
+    --o0-write-archive "$OUT/O4_b2_6432.o0_archive.json"
+
+python3 - << 'EOF'
+import json, math, statistics, sys
+from pathlib import Path
+out = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/ood_mmvet_218")
+
+def load(tag):
+    return json.load(open(out / f"{tag}.json"))
+
+def row(name, tag):
+    d = load(tag)
+    print(f"{name:>22} σ={d['sigma_mean']:.3f} N̄={d['mean_tree_width']:.2f} "
+          f"peak={d.get('peak_alloc_gib')} "
+          f"o0_hard={d.get('o0_n_archive_hard_fail')} o0_fp={d.get('o0_n_fingerprint_fail')}")
+
+ok = True
+print("--- GATE ---")
+for name, tag, expect in [
+    ("G1 C1 d3", "G1_c1_d3", 2.370),
+    ("G2 C1 6432", "G2_c1_6432", 2.677),
+    ("G3 B2 wide", "G3_b2_wide", 2.309),
+]:
+    d = load(tag)
+    hit = abs(d["sigma_mean"] - expect) < 0.0005
+    ok &= hit
+    if d.get("o0_n_archive_hard_fail") or d.get("o0_n_fingerprint_fail"):
+        ok = False
+        print(f"O0 FAIL {tag}")
+    row(name, tag)
+    print(f"   GATE σ={expect:.3f} {'OK' if hit else 'FAIL'}")
+
+print("--- OOD ---")
+for name, tag in [("O1","O1_c1_d3"),("O2","O2_c1_6432"),("O3","O3_b2_d3"),("O4","O4_b2_6432")]:
+    d = load(tag)
+    if d.get("o0_n_fingerprint_fail"):
+        ok = False
+        print(f"O0 FP FAIL {tag}")
+    row(name, tag)
+
+def paired(a,b):
+    A,B=load(a)["per_prompt_results"],load(b)["per_prompt_results"]
+    diffs=[x["sigma"]-y["sigma"] for x,y in zip(A,B)]
+    m=statistics.mean(diffs); se=statistics.stdev(diffs)/math.sqrt(218)
+    return m,se
+m24,e24=paired("O2_c1_6432","O4_b2_6432")
+print(f"R_wide pair/0.310={(m24/0.310):.4f} ±SE={(e24/0.310):.4f}")
+sys.exit(0 if ok else 1)
+EOF
+echo "=== DONE $(date) ==="

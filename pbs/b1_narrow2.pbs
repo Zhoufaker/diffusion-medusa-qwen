@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N b1_narrow2
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# B1 narrow-tree RETEST after the head-truncation fix. The v1 "5-head fixed
+# cost" was implementation waste, not structural: narrow trees passed trailing
+# zero fanouts, which built the correct (truncated) tree but still ran ALL 5
+# head forwards per round (~+10% round time from 2 unused lm_head GEMVs).
+# Now the folded eval path truncates the chain at the tree's max speculative
+# depth (LinkedMedusaHeads.forward(max_heads=...), exact by sequentiality;
+# unit-tested).
+#
+# Rows (eval 100, same V100 job, same manifest/seed, per-config greedy):
+#   1. B1 [.,3,2]x16   (d2) — now runs heads 0..2 only; head-to-head vs Phase A
+#   2. B1 [.,3,2,1]x16 (d3) — now runs heads 0..3 only; expected speed champion
+#   3. B1 [.,6,4,2,1]x24 (wide) — REGRESSION GATE: uses all 4 spec layers, no
+#      truncation applies; sigma/accept must reproduce the B1 eval (~2.307)
+#      modulo tok/s run drift. A sigma change means the truncation broke logic.
+#   4. Phase A [.,3,2]x16 — same-run control (cancels run-to-run drift)
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+B1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1
+PA=/scratch/li96/mz9869/medusa_outputs/linked_medusa_phaseA_general
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy \
+        --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== B1 NARROW v2 (truncated heads) $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+echo ""; echo "######## 1/4 B1 narrow depth-2  [.,3,2]x16  (heads 0..2 only) ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$B1/ckpt_best.pt" --fanout 1 3 2 0 0 --max-nodes 16 \
+    --out "$B1/eval_folded_narrow2_d2.json"
+
+echo ""; echo "######## 2/4 B1 narrow depth-3  [.,3,2,1]x16  (heads 0..3 only) ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$B1/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --out "$B1/eval_folded_narrow2_d3.json"
+
+echo ""; echo "######## 3/4 REGRESSION GATE: B1 wide [.,6,4,2,1]x24 (all heads) ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$B1/ckpt_best.pt" --fanout 1 6 4 2 1 --max-nodes 24 \
+    --out "$B1/eval_folded_narrow2_widegate.json"
+
+echo ""; echo "######## 4/4 Phase A folded [.,3,2]x16 SAME-RUN control ########"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+    --ckpt "$PA/ckpt_best.pt" --fanout 1 3 2 --max-nodes 16 \
+    --out "$B1/eval_folded_narrow2_phaseA_control.json"
+
+echo ""; echo "=== NARROW v2 TABLE ==="
+python3 - << 'EOF'
+import json
+base="/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b1/"
+rows=[("B1 [.,3,2]x16 (d2,trunc)","eval_folded_narrow2_d2.json"),
+      ("B1 [.,3,2,1]x16 (d3,trunc)","eval_folded_narrow2_d3.json"),
+      ("B1 [.,6,4,2,1]x24 (wide GATE)","eval_folded_narrow2_widegate.json"),
+      ("PhaseA [.,3,2]x16 ctrl","eval_folded_narrow2_phaseA_control.json")]
+print(f"{'config':>30} {'sigma':>6} {'N_bar':>6} {'tree t/s':>8} {'greedy':>7} {'speedup':>7}  accept[1..]")
+for name,f in rows:
+    d=json.load(open(base+f))
+    acc=" ".join(f"{x:.3f}" for x in d["per_position_accept_rate"][1:])
+    print(f"{name:>30} {d['sigma_mean']:>6.3f} {d['mean_tree_width']:>6.2f} "
+          f"{d['tree_tok_per_s']:>8.2f} {d['greedy_tok_per_s']:>7.2f} "
+          f"{d['net_speedup_vs_greedy']:>7.3f}  [{acc}]")
+print()
+print("v1 (untruncated) reference: d2 sigma 2.005 @40.81 t/s 1.383x | d3 2.100 @42.58 1.459x")
+print("wide GATE reference: sigma must ~= 2.307, accept ~= [0.754 0.362 0.132 0.039]")
+EOF
+echo "=== DONE $(date) ==="

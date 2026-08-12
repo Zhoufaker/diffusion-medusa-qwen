@@ -1,0 +1,118 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=08:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N c2_bridge
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Part C2: nested-300 bridge. ordered-manifest; [:100]==old100.
+# O0 LOCKED: archive hard for old100 + fingerprint for new200 (band=0.15).
+# Archives: c1_d3←final_eval; c1_6432←fanout_sweep c10; b2_*←final_eval.
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+B2=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2
+OUT=$C1/bridge_300
+MANIFEST=/scratch/li96/mz9869/eval_manifests/manifest_300.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 300 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy --ordered-manifest \
+        --check-greedy-bytes \
+        --manifest $MANIFEST --images-dir $IMAGES"
+
+ARCH_C1_D3=$C1/final_eval/c1_d3.json
+ARCH_C1_6432=$C1/fanout_sweep/c10_6432_32.json
+ARCH_B2_D3=$C1/final_eval/b2_d3.json
+# b2_6432: no matching archive (b2_wide is [.,6,4,2,1]×24 ≠ [.,6,4,3,2]×32)
+
+echo "=== C2 BRIDGE 300 $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT" /scratch/li96/mz9869/logs
+
+run () {
+    local tag=$1; shift
+    echo ""; echo "######## $tag  $* ########"
+    python3 -u -m scripts.eval_acceptance_tree $COMMON "$@" --out "$OUT/$tag.json"
+}
+
+run c1_d3   --ckpt "$C1/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --o0-archive "$ARCH_C1_D3" --o0-write-archive "$OUT/c1_d3.o0_archive.json"
+run c1_6432 --ckpt "$C1/ckpt_best.pt" --fanout 1 6 4 3 2 --max-nodes 32 \
+    --o0-archive "$ARCH_C1_6432" --o0-write-archive "$OUT/c1_6432.o0_archive.json"
+run b2_d3   --ckpt "$B2/ckpt_best.pt" --fanout 1 3 2 1 0 --max-nodes 16 \
+    --o0-archive "$ARCH_B2_D3" --o0-write-archive "$OUT/b2_d3.o0_archive.json"
+run b2_6432 --ckpt "$B2/ckpt_best.pt" --fanout 1 6 4 3 2 --max-nodes 32 \
+    --o0-write-archive "$OUT/b2_6432.o0_archive.json"
+# no --o0-archive: no bit-exact prior for B2×[.,6,4,3,2]×32; fingerprint all 300
+
+echo ""; echo "=== C2 BRIDGE TABLE ==="
+python3 - << 'EOF'
+import json, math, statistics, sys
+from pathlib import Path
+out = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/bridge_300")
+
+def stats(tag, gate100=None):
+    d = json.load(open(out / f"{tag}.json"))
+    pp = d["per_prompt_results"]
+    assert len(pp) == 300, len(pp)
+    s100 = statistics.mean(r["sigma"] for r in pp[:100])
+    s300 = statistics.mean(r["sigma"] for r in pp)
+    std300 = statistics.stdev(r["sigma"] for r in pp)
+    se300 = std300 / math.sqrt(300)
+    acc = d["per_position_accept_rate"]
+    a = [f"{x:.3f}" for x in (acc[1:]+[0]*4)[:4]]
+    note = ""
+    if gate100 is not None:
+        ok = abs(s100 - gate100) < 0.0005
+        note = f" GATE100={gate100:.3f} {'OK' if ok else 'FAIL'}"
+        if not ok:
+            stats.fail = True
+    o0 = (f" o0_hard={d.get('o0_n_archive_hard_fail')} "
+          f"o0_fp={d.get('o0_n_fingerprint_fail')} "
+          f"o0_info={d.get('o0_n_info_vs_greedy')}")
+    print(f"{tag:>10} σ100={s100:.3f} σ300={s300:.3f} Δ={s300-s100:+.3f} "
+          f"std300={std300:.3f} SE={se300:.4f} N̄={d['mean_tree_width']:.2f} "
+          f"spd={d['net_speedup_vs_greedy']:.3f} accept[{', '.join(a)}]{note}{o0}")
+    return s100, s300, se300
+
+stats.fail = False
+c1_d3 = stats("c1_d3", 2.370)
+c1_w = stats("c1_6432", 2.677)
+b2_d3 = stats("b2_d3", None)
+b2_w = stats("b2_6432", None)
+
+dirs = []
+for tag in ("c1_d3", "c1_6432", "b2_d3", "b2_6432"):
+    d = json.load(open(out / f"{tag}.json"))
+    pp = d["per_prompt_results"]
+    s100 = statistics.mean(r["sigma"] for r in pp[:100])
+    s300 = statistics.mean(r["sigma"] for r in pp)
+    dirs.append((tag, s300 - s100))
+print("σ300-σ100 directions:", dirs)
+signs = [1 if x > 0 else (-1 if x < 0 else 0) for _, x in dirs]
+print("same_direction:", len(set(s for s in signs if s != 0)) <= 1, "signs", signs)
+print(f"0.5% of 2.619 ≈ 0.013; SE_300(c1_6432)={c1_w[2]:.4f} → SE<0.013={c1_w[2] < 0.013}")
+
+for tag in ("c1_d3", "c1_6432", "b2_d3", "b2_6432"):
+    d = json.load(open(out / f"{tag}.json"))
+    if d.get("o0_n_archive_hard_fail") or d.get("o0_n_fingerprint_fail"):
+        print(f"O0 FAIL on {tag} — STOP"); sys.exit(2)
+
+if stats.fail:
+    print("C1 σ100 GATE FAIL — stop"); sys.exit(1)
+print("C1 σ100 GATES PASS; O0 PASS")
+EOF
+echo "=== DONE $(date) ==="

@@ -1,0 +1,56 @@
+#!/bin/bash
+#PBS -N phaseA_smoke
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l ngpus=1
+#PBS -l walltime=01:00:00
+#PBS -l wd
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Phase A SMOKE: gen ~300 general-domain cache + run the train pipeline for a
+# few dozen steps. HARD GATE = head_0 init loss < 1.0 (printed by
+# Trainer.startup_sanity as "[sanity §7.1] head_0_loss = ...").
+#   < 1.0 -> TARGET-convention hidden/token alignment is correct -> go full.
+#   blows up -> off-by-one in the cache generator -> fix before full gen.
+
+set -euo pipefail
+
+echo "=== JOB METADATA ==="
+echo "PBS_JOBID = ${PBS_JOBID:-unset}"
+echo "hostname  = $(hostname)"
+echo "date      = $(date)"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
+echo
+
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+
+SMOKE_CACHE=/scratch/li96/mz9869/cached_data/llava_general_smoke
+SMOKE_OUT=/scratch/li96/mz9869/medusa_outputs/phaseA_smoke
+
+echo "=== STEP 1: generate ~300 cache ==="
+python -u -m scripts.gen_cache_rollout \
+    --out-dir "$SMOKE_CACHE" \
+    --limit 300 \
+    --max-new 256
+
+echo
+echo "=== STEP 2: train pipeline smoke (40 steps; watch head_0 init loss) ==="
+python -u -m scripts.train --config config/linked_medusa_default.yaml --override \
+    dataset.kind=cached \
+    dataset.cache_dir="$SMOKE_CACHE" \
+    dataset.eval_split=null \
+    dataset.val_fraction=0.1 \
+    training.total_steps=40 \
+    logging.log_every=5 \
+    logging.eval_every=0 \
+    logging.save_every=0 \
+    logging.output_dir="$SMOKE_OUT"
+
+echo
+echo "=== DONE $(date) ==="

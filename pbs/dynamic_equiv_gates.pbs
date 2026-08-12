@@ -1,0 +1,67 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N dyn_gates
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# Dynamic-tree live equivalence gates (old 100). Acceptance triad item 1+2.
+# gate#1: [.,3,2,1]x16 → σ=2.370; gate#2: [.,6,4,2,1]x24 → σ=2.619 N̄=26.0
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+C1=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle
+OUT=$C1/dynamic_equiv_gates
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+COMMON="--mode tree --fold-bonus --reorg gather --n-prompts 100 --min-ref-words 80 \
+        --max-new-tokens 150 --seed 42 --measure-greedy --tree-builder dynamic \
+        --ckpt $C1/ckpt_best.pt --manifest $MANIFEST --images-dir $IMAGES"
+
+echo "=== DYNAMIC EQUIV GATES $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+cd "${PROJECT_ROOT}"
+mkdir -p "$OUT"
+
+# Reconfirm synthetic triad item 3 on the compute node too
+python -m pytest tests/test_dynamic_tree.py -v --tb=line
+
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+  --fanout 1 3 2 1 0 --max-nodes 16 --out "$OUT/gate1_d3.json"
+python3 -u -m scripts.eval_acceptance_tree $COMMON \
+  --fanout 1 6 4 2 1 --max-nodes 24 --out "$OUT/gate2_wide24.json"
+
+python3 - << 'EOF'
+import json, sys
+out = "/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/dynamic_equiv_gates/"
+g1 = json.load(open(out + "gate1_d3.json"))
+g2 = json.load(open(out + "gate2_wide24.json"))
+print(f"gate#1: builder={g1.get('tree_builder')} σ={g1['sigma_mean']:.3f} (need 2.370) "
+      f"N̄={g1['mean_tree_width']:.2f}")
+print(f"gate#2: builder={g2.get('tree_builder')} σ={g2['sigma_mean']:.3f} (need 2.619) "
+      f"N̄={g2['mean_tree_width']:.2f} (need 26.0)")
+ok1 = abs(g1["sigma_mean"] - 2.370) < 0.0005 and g1.get("tree_builder") == "dynamic"
+# N̄ anchor is the static final_eval value 25.996129… (docs “26.0” is rounded).
+# Require bit-match to static artifact, not the rounded 26.0±0.0005 which false-fails.
+import json as _json
+st = _json.load(open(
+    "/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/final_eval/c1_wide.json"))
+ok2 = (g2.get("tree_builder") == "dynamic"
+       and g2["sigma_mean"] == st["sigma_mean"]
+       and g2["mean_tree_width"] == st["mean_tree_width"])
+print(f"gate#2 vs static c1_wide: σ_eq={g2['sigma_mean']==st['sigma_mean']} "
+      f"N̄_eq={g2['mean_tree_width']==st['mean_tree_width']}")
+print(f"gate#1 {'PASS' if ok1 else 'FAIL'}; gate#2 {'PASS' if ok2 else 'FAIL'}")
+sys.exit(0 if (ok1 and ok2) else 1)
+EOF
+echo "=== DONE $(date) ==="

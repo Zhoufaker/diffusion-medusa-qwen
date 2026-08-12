@@ -1,0 +1,30 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=64GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N eval_greedy_agreement
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/medusa_outputs/eval_greedy_agreement.log
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+OUT=/scratch/li96/mz9869/medusa_outputs/linked_medusa_v1_full
+echo "================================================================"
+echo "GREEDY AGREEMENT diag: baseline tree & folded vs vanilla greedy"
+echo "classify first divergence: near-tie (fp16 kernel) vs HARD (bug)"
+echo "host: $(hostname)   date: $(date)   job: ${PBS_JOBID:-N/A}"
+echo "================================================================"
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+python3 -u -m scripts.eval_acceptance_tree \
+  --mode greedy_agreement --fanout 4 3 2 --max-nodes 16 \
+  --n-prompts 5 --max-new-tokens 150 \
+  --out ${OUT}/eval_greedy_agreement_bucketed.json
+echo "EXIT_CODE=$?"
+echo "DONE $(date)"

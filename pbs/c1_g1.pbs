@@ -1,0 +1,55 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=01:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N c1_g1
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+# C1 G1 — init equivalence gate (pre-train).
+# Load B2 ckpt into architecture with zero-init bonus_proj; folded wide eval.
+# σ and accept must match B2 exactly: 2.309 / [0.764, 0.373, 0.123, 0.033].
+# Any mismatch → STOP (do not proceed to G3/full train).
+
+set -euo pipefail
+PROJECT_ROOT="${HOME}/medusa-qwen"
+VENV="${HOME}/medusa-env"
+B2=/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2
+MANIFEST=/g/data/li96/mz9869/data/llava_subset_2k.json
+IMAGES=/g/data/li96/mz9869/data/coco_subset
+
+echo "=== C1 G1 $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${VENV}/bin/activate"
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+cd "${PROJECT_ROOT}"
+
+python3 -u -m scripts.eval_acceptance_tree \
+    --mode tree --fold-bonus --reorg gather \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+    --manifest "$MANIFEST" --images-dir "$IMAGES" \
+    --ckpt "$B2/ckpt_best.pt" \
+    --fanout 1 6 4 2 1 --max-nodes 24 \
+    --out "$B2/c1_g1_widegate.json"
+
+echo ""
+echo "=== G1 CHECK ==="
+python3 - << 'EOF'
+import json, sys
+d = json.load(open("/scratch/li96/mz9869/medusa_outputs/linked_medusa_5head_b2/c1_g1_widegate.json"))
+exp_sigma = 2.309
+exp_acc = [0.764, 0.373, 0.123, 0.033]
+got_sigma = d["sigma_mean"]
+got_acc = d["per_position_accept_rate"][1:5]
+print(f"sigma: got {got_sigma:.3f}  expect {exp_sigma:.3f}")
+print(f"accept[1..4]: got {[f'{x:.3f}' for x in got_acc]}")
+print(f"              expect {[f'{x:.3f}' for x in exp_acc]}")
+ok = (abs(got_sigma - exp_sigma) < 0.0005 and
+      all(abs(a-b) < 0.0005 for a,b in zip(got_acc, exp_acc)))
+print(f"G1 PASS: {ok}")
+sys.exit(0 if ok else 1)
+EOF
+echo "=== DONE $(date) ==="

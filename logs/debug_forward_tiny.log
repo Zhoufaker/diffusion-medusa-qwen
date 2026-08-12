@@ -1,0 +1,48 @@
+device          = cpu
+hidden_dim      = 3584
+num_heads       = 3
+num_blocks      = 2
+expansion       = 2
+effective_vocab = 151936
+batch_size      = 4
+seq_len_range   = (50, 64)
+loss_weights    = [1.0, 0.8, 0.64]
+lm_head_path    = /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+
+[tiny] CPU smoke mode: tiny dimensions + random base lm_head
+  shape = (512, 128), dtype = torch.float16  (synthetic)
+
+[33m=== A1: forward produces correct shapes ===[0m
+[32m[PASS][0m got 3 logits tensors
+[32m[PASS][0m head_0: shape (4, 62, 512) OK
+[32m[PASS][0m head_1: shape (4, 62, 512) OK
+[32m[PASS][0m head_2: shape (4, 62, 512) OK
+
+[33m=== A2: head_0 forward equals base_lm_head @ h_t (identity-init) ===[0m
+[2m[info][0m max |diff| = 0.000e+00   max relative diff = 0.000e+00
+[32m[PASS][0m head_0 == base_lm_head(h_t)  within abs_tol=0.0001
+
+[33m=== A5: head_0 grads non-zero when only head_2's loss is back-propagated ===[0m
+[2m[info][0m head_0 params: 6 have non-zero grad, 13 have all-zero grad, 0 have grad=None
+[2m[info][0m head_0 max |grad| (any param) = 4.424e-03
+[2m[info][0m head_2_loss = 6.4798, head_0_loss = 6.2671
+[2m[info][0m head_0 (excluding lm_head) max |grad| = 4.424e-03
+[32m[PASS][0m head_0 (input_resblock + body) has non-zero gradient from head_2's loss
+
+[33m=== A6: gradient norms are finite and not exploding ===[0m
+[2m[info][0m per-head ||grad||_2: head_0=8.023e-01, head_1=1.258e+00, head_2=1.519e+00
+[2m[info][0m global ||grad||_2 = 2.129e+00    nan_tensors=0    inf_tensors=0
+[32m[PASS][0m gradient norms finite and bounded (global=2.129e+00)
+
+[33m=== A7: one fwd+bwd+opt-step at longest synthetic seq w/o OOM ===[0m
+[2m[info][0m running on CPU — peak-memory stat not collected (OOM check is GPU-only)
+[32m[PASS][0m one full training step at B=4, L=64 completed; total_loss=15.474
+
+[33m=== SUMMARY ===[0m
+  A1: [32mPASS[0m
+  A2: [32mPASS[0m
+  A5: [32mPASS[0m
+  A6: [32mPASS[0m
+  A7: [32mPASS[0m
+
+[32mPhase A overall: PASS[0m

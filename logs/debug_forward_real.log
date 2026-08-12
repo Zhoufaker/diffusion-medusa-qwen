@@ -1,0 +1,79 @@
+device          = cuda
+cuda device     = Tesla V100-SXM2-32GB
+cuda capability = (7, 0)
+hidden_dim      = 3584
+num_heads       = 3
+num_blocks      = 2
+expansion       = 2
+effective_vocab = 151936
+batch_size      = 4
+seq_len_range   = (50, 256)
+loss_weights    = [1.0, 0.8, 0.64]
+c2_tol_abs      = 0.001
+c3_l2_threshold = 1e-06
+c4 stress       = batch=4, seq=256
+c5_tol_abs      = 0.0
+lm_head_path    = /scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors
+
+Loading base lm_head from disk...
+  shape = (152064, 3584), dtype = torch.float16
+
+[33m=== C1: forward produces correct shapes ===[0m
+[2m[info][0m vocab_size = 152064    B=4, L=227
+[2m[info][0m head_0 shape: (4, 227, 152064)
+[2m[info][0m head_1 shape: (4, 227, 152064)
+[2m[info][0m head_2 shape: (4, 227, 152064)
+[32m[PASS][0m all 3 heads emit shape (B, L, 152064)
+
+[33m=== C2: identity init — head_0 logits ≈ base_lm_head @ h_t   (tol < 1e-3) ===[0m
+[2m[info][0m head_0 logits range: max|expected| = 5.129e+00    max|abs diff| = 0.000e+00    max relative diff = 0.000e+00
+[32m[PASS][0m max |abs diff| = 0.000e+00  ≤  tol 1.000e-03
+
+[33m=== C3: chain connectivity — total_loss=loss_2; ||head_0 grads||_2 > 1e-6 ===[0m
+[2m[info][0m head_2_loss        = 14.4530
+[2m[info][0m #head_0 params     = 19   (non-zero grad: 6, zero grad: 13, no-grad: 0)
+[2m[info][0m ||grad||_2  (head_0 input_resblock + body) = 1.451e+00
+[2m[info][0m ||grad||_2  (head_0 lm_head)               = 0.000e+00     ← may legitimately be 0: lm_head only feeds loss_0 (weight=0); chain passes pre-lm_head h')
+[2m[info][0m ||grad||_2  (head_0 ALL params, aggregate) = 1.451e+00   ← the C3 number
+[32m[PASS][0m ||head_0 grads||_2 = 1.451e+00  >  threshold 1e-06
+
+[33m=== C4: fwd+bwd+opt-step  batch=4, seq=256  — peak memory ===[0m
+Traceback (most recent call last):
+  File "/home/562/mz9869/medusa-qwen/scripts/debug_forward.py", line 511, in main
+    results["C4"] = check_c4_oom_at_full_seq(model, args, device)
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/562/mz9869/medusa-qwen/scripts/debug_forward.py", line 319, in check_c4_oom_at_full_seq
+    optimizer.step()
+  File "/home/562/mz9869/medusa-env/lib/python3.11/site-packages/torch/optim/optimizer.py", line 487, in wrapper
+    out = func(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/562/mz9869/medusa-env/lib/python3.11/site-packages/torch/optim/optimizer.py", line 91, in _use_grad
+    ret = func(self, *args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/562/mz9869/medusa-env/lib/python3.11/site-packages/torch/optim/adamw.py", line 209, in step
+    has_complex = self._init_group(
+                  ^^^^^^^^^^^^^^^^^
+  File "/home/562/mz9869/medusa-env/lib/python3.11/site-packages/torch/optim/adamw.py", line 148, in _init_group
+    state["exp_avg"] = torch.zeros_like(
+                       ^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 2.03 GiB. GPU 0 has a total capacity of 31.73 GiB of which 1.93 GiB is free. Including non-PyTorch memory, this process has 29.80 GiB memory in use. Of the allocated memory 28.99 GiB is allocated by PyTorch, and 446.06 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+
+[33m=== C5: determinism — same batch → identical logits across two forwards ===[0m
+[2m[info][0m head_0 max |abs diff| between runs = 0.000e+00
+[2m[info][0m head_1 max |abs diff| between runs = 0.000e+00
+[2m[info][0m head_2 max |abs diff| between runs = 0.000e+00
+[32m[PASS][0m two forwards bit-exact identical (max |diff| = 0)
+
+[33m=== A6 (bonus): per-head grad norms with default loss weights, NaN/Inf scan ===[0m
+[2m[info][0m per-head ||grad||_2: head_0=3.294e+00, head_1=4.306e+00, head_2=4.959e+00
+[2m[info][0m NaN tensors = 0    Inf tensors = 0
+[32m[PASS][0m gradient norms finite, no NaN/Inf
+
+[33m=== SUMMARY (C1..C5 — these are the formal must-pass checks) ===[0m
+  C1: [32mPASS[0m
+  C2: [32mPASS[0m
+  C3: [32mPASS[0m
+  C4: [31mFAIL[0m
+  C5: [32mPASS[0m
+
+[31mPhase A (C1..C5) overall: FAIL[0m

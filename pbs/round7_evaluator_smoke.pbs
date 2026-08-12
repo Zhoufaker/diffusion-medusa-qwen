@@ -1,0 +1,76 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N r7_smoke
+#PBS -j oe
+
+# Round-7: one small evaluator run confirming the gap-only predicate is wired
+# through the live O0 path (classifier, report fields, exit code). Not a
+# re-measurement: 4 prompts, gate100 config.
+
+set -euo pipefail
+
+# Log destination is supplied by the submitter (qsub -o "$MEDUSA_LOG_DIR");
+# no #PBS -o here, so the script carries no site-specific log path.
+: "${MEDUSA_LOG_DIR:?set MEDUSA_LOG_DIR and pass it to qsub -o}"
+: "${MEDUSA_PROJECT_ROOT:?}"
+: "${MEDUSA_VENV:?}"
+: "${HF_HOME:?}"
+: "${MEDUSA_CKPT_C1:?}"
+: "${MEDUSA_MANIFEST100:?}"
+: "${MEDUSA_IMAGES:?}"
+: "${MEDUSA_OUT:?}"
+
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
+echo "=== ROUND7 EVALUATOR SMOKE $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${MEDUSA_VENV}/bin/activate"
+cd "${MEDUSA_PROJECT_ROOT}"
+mkdir -p "${MEDUSA_OUT}"
+
+python -m pytest tests/test_o0_and_ordered.py tests/test_o0_cli_integration.py \
+  tests/test_integrity_path_norm.py tests/test_pbs_log_portability.py -q --tb=line
+
+python3 -u -m scripts.eval_acceptance_tree \
+  --mode tree --fold-bonus --reorg gather --tree-builder static \
+  --ckpt "${MEDUSA_CKPT_C1}" \
+  --manifest "${MEDUSA_MANIFEST100}" --images-dir "${MEDUSA_IMAGES}" \
+  --n-prompts 4 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+  --fanout 1 3 2 1 0 --max-nodes 16 \
+  --check-greedy-bytes \
+  --out "${MEDUSA_OUT}/smoke_gate4_c1_d3.json"
+
+echo "=== SMOKE DONE $(date) ==="
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+p = Path(os.environ["MEDUSA_OUT"]) / "smoke_gate4_c1_d3.o0_report.json"
+d = json.loads(p.read_text(encoding="utf-8"))
+print(json.dumps({
+    "near_tie_rule": d.get("near_tie_rule"),
+    "official_claim": d.get("official_claim"),
+    "kernel_band": d.get("kernel_band"),
+    "n_prompts": d.get("n_prompts"),
+    "n_exact": d.get("n_exact"),
+    "n_near_tie": d.get("n_near_tie"),
+    "n_hard": d.get("n_hard"),
+    "n_len_boundary": d.get("n_len_boundary"),
+    "greedy_numerical_safety_pass": d.get("greedy_numerical_safety_pass"),
+    "has_fingerprint": bool(d.get("fingerprint")),
+    "fingerprint_schema": (d.get("fingerprint") or {}).get("schema"),
+    "row_has_prefix_sha": bool((d.get("per_prompt") or [{}])[0].get("greedy_prefix_sha256")),
+}, indent=2, ensure_ascii=False))
+assert d.get("near_tie_rule") == "candidate_specific_gap_only", "predicate not wired"
+assert "greedy_top2 or" not in (d.get("official_claim") or ""), "stale claim"
+assert d.get("fingerprint"), "fingerprint missing"
+assert all(r.get("greedy_prefix_sha256") for r in d.get("per_prompt") or []), \
+    "greedy_prefix_sha256 missing"
+print("SMOKE WIRING OK")
+PY
+ls -la "${MEDUSA_OUT}"

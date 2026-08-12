@@ -1,0 +1,186 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=12:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N v2_ood
+#PBS -j oe
+
+# v2 OOD (MM-Vet 218) + v1→v2 Δ table (expects in-domain v2 artifacts present).
+# All paths via fail-fast env vars — see B_layer RERUN.md.
+
+set -euo pipefail
+
+# Log destination is supplied by the submitter (qsub -o "$MEDUSA_LOG_DIR");
+# no #PBS -o here, so the script carries no site-specific log path.
+: "${MEDUSA_LOG_DIR:?set MEDUSA_LOG_DIR and pass it to qsub -o}"
+: "${MEDUSA_PROJECT_ROOT:?}"
+: "${MEDUSA_VENV:?}"
+: "${HF_HOME:?}"
+: "${MEDUSA_CKPT_C1:?}"
+: "${MEDUSA_CKPT_B2:?}"
+: "${MEDUSA_MANIFEST_OOD:?}"
+: "${MEDUSA_IMAGES_OOD:?}"
+: "${MEDUSA_OUT:?}"
+: "${MEDUSA_C1_ROOT:?}"   # v1 lineage roots (final_eval / bridge / ood …)
+
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+
+echo "=== V2 OOD $(hostname) $(date) job=${PBS_JOBID:-N/A} ==="
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source "${MEDUSA_VENV}/bin/activate"
+cd "${MEDUSA_PROJECT_ROOT}"
+mkdir -p "${MEDUSA_OUT}"
+
+COMMON_OOD="--mode tree --fold-bonus --reorg gather --n-prompts 218 --min-ref-words 0 \
+  --max-new-tokens 150 --seed 42 --ordered-manifest --check-greedy-bytes \
+  --max-pixels 501760 --manifest ${MEDUSA_MANIFEST_OOD} --images-dir ${MEDUSA_IMAGES_OOD}"
+
+run () {
+  local tag=$1; shift
+  echo ""; echo "######## $tag ########"
+  python3 -u -m scripts.eval_acceptance_tree "$@" \
+    --out "${MEDUSA_OUT}/${tag}.json" \
+    --o0-write-archive "${MEDUSA_OUT}/${tag}.spec_archive.json" \
+    --o0-write-greedy-archive "${MEDUSA_OUT}/${tag}.greedy_archive.json"
+}
+
+run O1_c1_d3 --tree-builder static --ckpt "${MEDUSA_CKPT_C1}" \
+  $COMMON_OOD --fanout 1 3 2 1 0 --max-nodes 16
+run O2_c1_6432 --tree-builder static --ckpt "${MEDUSA_CKPT_C1}" \
+  $COMMON_OOD --fanout 1 6 4 3 2 --max-nodes 32
+run O3_b2_d3 --tree-builder static --ckpt "${MEDUSA_CKPT_B2}" \
+  $COMMON_OOD --fanout 1 3 2 1 0 --max-nodes 16
+run O4_b2_6432 --tree-builder static --ckpt "${MEDUSA_CKPT_B2}" \
+  $COMMON_OOD --fanout 1 6 4 3 2 --max-nodes 32
+
+echo ""; echo "===== V1→V2 Δ + PRE-REG READ ====="
+# Paths in heredoc come only from env (no hardcoded absolute roots).
+python3 - <<'EOF'
+import json, math, os, statistics, sys
+from pathlib import Path
+
+C1 = Path(os.environ["MEDUSA_C1_ROOT"])
+OUT = Path(os.environ["MEDUSA_OUT"])
+V1_MAP = {
+    "gate100_c1_d3": C1 / "final_eval/c1_d3.json",
+    "gate100_c1_6432": C1 / "fanout_sweep/c10_6432_32.json",
+    "gate100_b2_wide": C1 / "final_eval/b2_wide.json",
+    "bridge300_c1_d3": C1 / "bridge_300/c1_d3.json",
+    "bridge300_c1_6432": C1 / "bridge_300/c1_6432.json",
+    "bridge300_b2_d3": C1 / "bridge_300/b2_d3.json",
+    "bridge300_b2_6432": C1 / "bridge_300/b2_6432.json",
+    "dyn_k8_n24": C1 / "dynamic_sweep_300/dyn_k8_n24.json",
+    "dyn_k8_n32": C1 / "dynamic_sweep_300/dyn_k8_n32.json",
+    "O1_c1_d3": C1 / "ood_mmvet_218/O1_c1_d3.json",
+    "O2_c1_6432": C1 / "ood_mmvet_218/O2_c1_6432.json",
+    "O3_b2_d3": C1 / "ood_mmvet_218/O3_b2_d3.json",
+    "O4_b2_6432": C1 / "ood_mmvet_218/O4_b2_6432.json",
+}
+
+rows = {}
+stops = []
+print(f"{'tag':22s} {'σ_v1':>8} {'σ_v2':>8} {'Δ%':>8} {'band':>8} {'byte':>8} {'safe':>8} {'len_b':>5} {'near':>5} {'hard':>5}")
+for tag, v1p in V1_MAP.items():
+    v2p = OUT / f"{tag}.json"
+    if not v2p.exists() or not v1p.exists():
+        stops.append(f"MISSING {tag}")
+        continue
+    v1 = json.load(open(v1p, encoding="utf-8"))
+    v2 = json.load(open(v2p, encoding="utf-8"))
+    s1, s2 = v1["sigma_mean"], v2["sigma_mean"]
+    dlt = (s2 - s1) / s1 * 100.0
+    in_band = -0.8 <= dlt <= -0.3
+    flag = ""
+    if dlt > 0 or abs(dlt) > 1.5:
+        flag = "STOP"
+        stops.append(f"{tag}: Δ%={dlt:+.3f} outside pre-reg")
+    elif not in_band:
+        flag = "note"
+    byte_p = v2.get("o0_greedy_byte_exact_pass")
+    safe_p = v2.get("o0_greedy_numerical_safety_pass")
+    lb = v2.get("o0_n_len_boundary")
+    nt = v2.get("o0_n_near_tie")
+    hd = v2.get("o0_n_hard")
+    arch_p = v2.get("o0_archive_reproducibility_pass")
+    if hd and hd > 0:
+        stops.append(f"{tag}: hard={hd}")
+        flag = "STOP"
+    if lb and lb > 0:
+        stops.append(f"{tag}: len_boundary={lb} (expected 0)")
+        flag = "STOP"
+    rows[tag] = {
+        "sigma_v1": s1, "sigma_v2": s2, "delta_pct": dlt,
+        "in_expected_band": in_band,
+        "sigma_round_pooled_v2": v2.get("sigma_round_pooled"),
+        "nbar_prompt_mean": v2.get("nbar_prompt_mean"),
+        "nbar_round_pooled": v2.get("nbar_round_pooled"),
+        "o0_n_exact": v2.get("o0_n_exact"),
+        "o0_n_len_boundary": lb, "o0_n_near_tie": nt, "o0_n_hard": hd,
+        "o0_greedy_byte_exact_pass": byte_p,
+        "o0_greedy_numerical_safety_pass": safe_p,
+        "o0_archive_reproducibility_pass": arch_p,
+        "o0_legacy_numerical_safety_pass_deprecated": v2.get(
+            "o0_legacy_numerical_safety_pass_deprecated", safe_p),
+        "runner": v2.get("runner"),
+    }
+    print(f"{tag:22s} {s1:8.4f} {s2:8.4f} {dlt:+8.3f} {flag or ('OK' if in_band else 'out'):>8} "
+          f"{str(byte_p):>8} {str(safe_p):>8} {lb!s:>5} {nt!s:>5} {hd!s:>5}")
+
+a = json.load(open(OUT / "dyn_k8_n32.json", encoding="utf-8"))
+b = json.load(open(OUT / "bridge300_c1_6432.json", encoding="utf-8"))
+mb = {str(r["id"]): r["sigma"] for r in b["per_prompt_results"]}
+diffs = [r["sigma"] - mb[str(r["id"])] for r in a["per_prompt_results"]]
+dm = statistics.mean(diffs)
+dse = statistics.stdev(diffs) / math.sqrt(len(diffs))
+band = 0.005 * b["sigma_mean"]
+champ = {
+    "delta_mean": dm, "delta_se": dse, "n": len(diffs),
+    "band_0.5pct_of_6432": band,
+    "out_of_band": abs(dm) > band,
+    "expected_order": "+0.10",
+}
+
+o2 = json.load(open(OUT / "O2_c1_6432.json", encoding="utf-8"))
+o4 = json.load(open(OUT / "O4_b2_6432.json", encoding="utf-8"))
+dlt_ood = [a["sigma"] - b["sigma"] for a, b in
+           zip(o2["per_prompt_results"], o4["per_prompt_results"])]
+m = statistics.mean(dlt_ood)
+se = statistics.stdev(dlt_ood) / math.sqrt(len(dlt_ood))
+R100 = m / 0.310
+R100se = se / 0.310
+R = {"delta_mean": m, "delta_se": se, "R_100": R100, "R_100_se": R100se,
+     "v1_R_100": 0.435, "band_mid": [0.3, 0.6],
+     "same_band": 0.3 <= R100 <= 0.6}
+
+summary = {
+    "job": os.environ.get("PBS_JOBID"),
+    "protocol": "v2_hardcap dual_verdict",
+    "pre_reg": {
+        "delta_pct_band": [-0.8, -0.3],
+        "stop_if_abs_gt": 1.5,
+        "stop_if_positive": True,
+        "len_boundary_expected": 0,
+    },
+    "rows": rows,
+    "champion_paired_sigma": champ,
+    "ood_R": R,
+    "stops": stops,
+    "overall": "STOP" if stops else "PASS_DELTA_BAND",
+}
+json.dump(summary, open(OUT / "v1_to_v2_delta_summary.json", "w", encoding="utf-8"), indent=2)
+print("\nchampion Δσ(dyn_n32−6432) = "
+      f"{dm:+.4f} ± {dse:.4f}  (0.5% band={band:.4f}) out={champ['out_of_band']}")
+print(f"OOD R_100 = {R100:.3f} ± {R100se:.3f}  (v1 0.435; same_mid_band={R['same_band']})")
+print(f"\nOVERALL: {summary['overall']}")
+if stops:
+    print("STOPS:")
+    for s in stops:
+        print(" ", s)
+    sys.exit(1)
+EOF
+
+echo "=== V2 OOD+DELTA DONE $(date) ==="

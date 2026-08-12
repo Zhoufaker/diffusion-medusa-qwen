@@ -1,0 +1,20 @@
+#!/bin/bash
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1,ncpus=12,mem=96GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N cap_gpu_e2e
+#PBS -j oe
+#PBS -o /scratch/li96/mz9869/logs/
+
+set -euo pipefail
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+module load python3/3.11.0 cuda/12.3.2 2>/dev/null || true
+source ~/medusa-env/bin/activate
+cd ~/medusa-qwen
+python -m pytest tests/test_max_new_cap.py tests/test_max_new_cap_gpu.py -v --tb=short
+echo "=== DONE $(date) ==="
