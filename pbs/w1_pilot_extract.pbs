@@ -1,0 +1,33 @@
+#!/bin/bash
+# W1 pilot: 5-layer ctx feature extraction, indices 0-499 (2 shards).
+# Gate: code review passed BEFORE qsub (算力花费纪律).
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=200GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=02:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N w1_pilot_extract
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+
+set -eu
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+cd /home/562/mz9869/medusa-qwen
+echo "=== W1 pilot extract $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/extract_ctx_features.py \
+    --start-idx 0 --end-idx 500 \
+    --out-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k \
+    --manifest-name ctx_manifest_pilot.json
+echo "=== shard sizes ==="
+ls -la /scratch/li96/mz9869/dflash_data/ctx_cache_35k/
+echo "=== DONE $(date) ==="
