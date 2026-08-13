@@ -1,6 +1,9 @@
 #!/bin/bash
 # W1 pilot: 5-layer ctx feature extraction, indices 0-499 (2 shards).
 # Gate: code review passed BEFORE qsub (算力花费纪律).
+# Pilot 产物写隔离目录 ctx_cache_35k_pilot（非正式缓存目录）：全量抽取时从
+# 索引 0 完整重抽，保证正式缓存出自单一 commit 的干净谱系；pilot 分片仅作
+# 吞吐/格式验证用，全量通过后可删。
 #PBS -P li96
 #PBS -q dgxa100
 #PBS -l ncpus=16
@@ -26,8 +29,8 @@ cd /home/562/mz9869/medusa-qwen
 echo "=== W1 pilot extract $(date) commit $(git rev-parse --short HEAD) ==="
 python scripts/extract_ctx_features.py \
     --start-idx 0 --end-idx 500 \
-    --out-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k \
+    --out-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k_pilot \
     --manifest-name ctx_manifest_pilot.json
 echo "=== shard sizes ==="
-ls -la /scratch/li96/mz9869/dflash_data/ctx_cache_35k/
+ls -la /scratch/li96/mz9869/dflash_data/ctx_cache_35k_pilot/
 echo "=== DONE $(date) ==="
