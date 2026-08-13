@@ -31,6 +31,11 @@
   含 .git 与 tag linked-medusa-final；r1 无 .git 版本保留）
 - 待办：冷藏项约 470–500G（非冠军 ckpt / smoke / v1 / phaseA）论文投稿后再清
   （本次判定：不删）
+- 长期资产 touch 名单（scratch 100 天 atime，定期访问防清除）：
+  - /scratch/li96/mz9869/archives/onpolicy_data_legacy.tar（5.3G，B2 数据冷备，
+    2026-08-13 建，三重验证通过；原散件目录暂保留——W1 抽取依赖其中
+    rollout_prompts.json 与 images/，删除待全量抽取完成后另行授权）
+  - （待办）llava_general_35k 旧缓存 tar 收编——同样等全量抽取+审计通过
 
 ## 工作纪律
 - 预注册优先：所有阈值、统计检验在数据到来前锁定
