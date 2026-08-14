@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .claude/settings.local.json
 external/dflash/
+external/dspark-aeon-27b/
