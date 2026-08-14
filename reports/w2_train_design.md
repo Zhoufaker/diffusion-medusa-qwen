@@ -94,12 +94,13 @@ blk2(p=3) q  ■    ■    ■    ·    ·    ·   |  ·   ·   ·  |  ■   ■
 blk3(p=4) q  ■    ■    ■    ■    ·    ·   |  ·   ·   ·  |  ·   ·   ·  |  ■   ■   ■
 ```
 
-- **主路径（A100）**：FlexAttention `mask_mod(b,h,q_idx,kv_idx)` 闭包读
-  (块归属表, anchor 位表)——布尔逻辑与上表逐元素等价
-- **回退/交叉验证路径**：4D additive mask (1,1,Q,KV) + sdpa（旧线 probe_4d_mask
-  已验证 sdpa 接受任意 4D mask）。两路径在相同输入下 logits 必须一致：
-  CPU 单测用 sdpa-vs-eager 先验证 mask 本身，Flex-vs-sdpa 等价留 smoke 上卡验
-- 掉卡兼容：V100 只有 sdpa 路径（FlexAttention 需 sm80+），与 B3c 结论一致
+- **D1 训练主路径（审查修订 F4）**：**4D additive mask (1,1,Q,KV) + sdpa**
+  （旧线 probe_4d_mask 已验证 sdpa 接受任意 4D mask；V100/A100 通用）
+- FlexAttention：降为 **W3 速度优化候选**，不接入 D1 循环。
+  `flex_mask_mod_factory` 代码保留（docstring 已标注候选身份），其布尔语义
+  与 4D mask 的逐元素等价有单测锁定；数值等价验证推迟到 W3 上卡消融
+- 正确性交叉验证：CPU 单测 sdpa-vs-eager logits 一致；smoke 门 2 在卡上以
+  fp32 复验 sdpa-vs-eager（首 batch，max|Δ|<1e-4）
 
 ### 1d. ctx 对齐规范（TARGET convention，历史事故高发区）
 
@@ -140,9 +141,15 @@ T=635，L=256）：
   block_size=16, gamma=7.0, alpha=1.5, max_anchors=512,
   lr=6e-4, schedule="cosine", warmup_ratio=0.04, epochs=6,
   grad_clip=1.0, weight_decay=0.01（论文未述，AdamW 惯例值，标注待敏感性检查）,
-  optimizer="adamw", dtype=bf16, seed=42,
+  optimizer="adamw", dtype=bf16, seed=42, data_seed=43,
   batch_seqs=4（等效噪声 token ~1.4 万/步，见 §1g）,
-  grad_accum=1, save_best_on="val_weighted_ce", save_every_steps=2000
+  grad_accum=1, save_best_on="val_weighted_ce"（best + 每 epoch 档）
+- **数据切分（审查修订 F2）**：val = 全索引（过滤后）中 seed=43 固定抽 500 条，
+  落盘 `val_indices.json`，train 硬排除；smoke 训练集 = 前 2000 条非 val 索引；
+  L<2 样本入库前过滤（F1），数量记入 train_manifest.json
+- **anchor 随机性（审查修订 F3）**：rng = derive(data_seed=43, epoch, sample_idx)
+  ——同三元组比特级复现、跨 epoch 重采样（论文随机 anchor 语义）、
+  val 恒用 epoch=0 固定采样
 - 词表：lm_head 物理 152064，loss 前不 mask phantom 行（label 恒 <151936，
   CE 对未命中行无梯度贡献偏置；推理侧沿用 argmax_masked）
 
@@ -198,6 +205,9 @@ batch 按噪声 token 计：batch_seqs=4 × K̄216 × 16 ≈ 13.8K noise tok/步
 2. attention_bias：Qwen2.5 为 True（QKV 有 bias）、Qwen3 默认 False——
    同上理由取 False（drafter 自身结构选择，与 target 无耦合），记入 config
 3. γ=7 取自论文 block16；若 W3 消融 block size 需按对照表换 γ
-4. weight_decay 论文未述（0.01 惯例值，smoke 后敏感性检查）
+4. weight_decay 论文未述（0.01 惯例值，smoke 后敏感性检查）；
+   **敏感性清单增补（审查登记项）**：当前 AdamW 对 RMSNorm 权重与融合 fc
+   同样施加 weight decay——业界常规是 norm/embedding 免 decay；
+   W3 敏感性检查项：param-group 拆分（norm 免 decay）vs 现状的 val CE 对比
 5. FlexAttention 与 sdpa 的数值一致性在 GPU 上才可最终确认（CPU 先证 mask
    语义等价）

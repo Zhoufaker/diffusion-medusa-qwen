@@ -119,9 +119,10 @@ def additive_4d(allow: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
 
 def flex_mask_mod_factory(anchor_of_q: torch.Tensor, block_of: torch.Tensor,
                           ctx_len: int):
-    """FlexAttention mask_mod closure (A100 main path, §1c). Same boolean
-    semantics as allowed_bool_mask; unit-tested for elementwise equivalence,
-    numeric parity vs sdpa is verified on-GPU at smoke."""
+    """FlexAttention mask_mod closure — W3 speed-optimization CANDIDATE only
+    (design §1c revised: D1 training main path is the 4D additive sdpa mask).
+    Same boolean semantics as allowed_bool_mask; unit-tested for elementwise
+    equivalence. Kept for the W3 ablation; not wired into the D1 loop."""
     def mask_mod(b, h, q_idx, kv_idx):
         is_ctx = kv_idx < ctx_len
         ctx_ok = kv_idx < anchor_of_q[q_idx]
@@ -163,8 +164,11 @@ class CtxShardDataset(torch.utils.data.Dataset):
         self.samples = {int(k): v for k, v in man["samples"].items()
                         if not v.get("failed")}
         self.shard_size = man["shard_size"]
-        self.indices = sorted(indices if indices is not None
-                              else self.samples.keys())
+        cand = sorted(indices if indices is not None else self.samples.keys())
+        # F1: L<2 has no legal anchor (need >=1 supervisable slot) — filter,
+        # count goes into the training manifest.
+        self.filtered_short = [i for i in cand if self.samples[i]["L"] < 2]
+        self.indices = [i for i in cand if self.samples[i]["L"] >= 2]
         self.mask_token_id = mask_token_id
         self._handles: dict[str, object] = {}
         self._lru: list[str] = []
@@ -192,16 +196,22 @@ class CtxShardDataset(torch.utils.data.Dataset):
         assert not (ids == self.mask_token_id).any(), \
             f"mask token {self.mask_token_id} occurs in sample {idx} (§1a guard)"
         r = self.samples[idx]
+        mm_pos = [e["pos"] for e in r.get("mismatch_head16", [])]
+        assert all(p < r["L"] for p in mm_pos), \
+            f"sample {idx}: mismatch_pos out of rollout range (manifest 谱系损坏?)"
         meta = {"idx": idx, "n_match": r["n_match"], "n_pos": r["n_pos"],
-                "mismatch_pos": [e["pos"] for e in r.get("mismatch_head16", [])],
-                "L": r["L"]}
+                "mismatch_pos": mm_pos, "L": r["L"]}
         return {"ids": ids, "ctx": ctx, "spans": spans, "meta": meta}
 
 
 def collate_packed(items: list[dict], block_size: int, alpha: float,
-                   max_anchors: int, rng: random.Random,
+                   max_anchors: int, seed: int, epoch: int,
                    mask_token_id: int = MASK_TOKEN_ID) -> dict:
     """Sample anchors + pack + pad a batch (design §1b padding rules).
+
+    F3: anchor rng derives from (seed, epoch, sample_idx) — same triple is
+    bit-reproducible, epochs resample (paper random anchors), val pins
+    epoch=0 for a fixed evaluation set.
 
     Returns ctx (Bs,5,Tmax,H) bf16, noise_ids (Bs,Nmax), noise_pos, labels,
     allow (Bs,Nmax,Tmax+Nmax) bool, valid_noise, position_ids (Bs,Tmax+Nmax),
@@ -211,7 +221,10 @@ def collate_packed(items: list[dict], block_size: int, alpha: float,
     for it in items:
         spans = it["spans"].tolist()        # [vs, ve, 0, P, P, T]
         P, T = spans[4], spans[5]           # rollout span [P, T)
+        rng = random.Random(f"{seed}:{epoch}:{it['meta']['idx']}")
         anchors = sample_anchors(P, T, alpha, max_anchors, rng)
+        assert anchors, (f"sample {it['meta']['idx']}: K=0 anchors "
+                         f"(L<2 should have been filtered, F1)")
         packed.append(pack_blocks(it["ids"], anchors, block_size,
                                   mask_token_id, it["meta"]))
         ctxs.append(it["ctx"])

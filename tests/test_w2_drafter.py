@@ -179,9 +179,8 @@ def test_pilot_shard_roundtrip_spans_and_collate():
     vs, ve, ps, pe, rs, re = it0["spans"].tolist()
     assert (ps, pe) == (0, 379) and (rs, re) == (379, 635)  # manifest idx0
     assert it0["ctx"].shape == (5, 635, 3584) and it0["ids"].shape[0] == 635
-    rng = random.Random(43)
     batch = collate_packed([ds[0], ds[1]], block_size=16, alpha=0.1,
-                           max_anchors=8, rng=rng)
+                           max_anchors=8, seed=43, epoch=0)
     Bs, N = batch["labels"].shape
     Tmax = batch["ctx_len"]
     assert batch["ctx"].shape[:2] == (2, 5) and batch["ctx"].shape[2] == Tmax
@@ -200,3 +199,115 @@ def test_pilot_shard_roundtrip_spans_and_collate():
     if pad_rows.any():
         sub = batch["allow"][pad_rows]
         assert torch.all(sub[:, 0]) and sub[:, 1:].sum() == 0
+
+
+# ------------------------------------------------- F1: short-sample filter --
+def _fake_cache(tmp_path, Ls=(1, 2, 150)):
+    from safetensors.torch import save_file
+    tensors, samples = {}, {}
+    for i, L in enumerate(Ls):
+        P = 10
+        T = P + L
+        ids = torch.arange(T)
+        tensors[f"{i}.ids"] = ids
+        tensors[f"{i}.ctx"] = torch.zeros(5, T, 8, dtype=torch.bfloat16)
+        tensors[f"{i}.spans"] = torch.tensor([2, 6, 0, P, P, T])
+        samples[str(i)] = {"idx": i, "T": T, "P": P, "L": L, "n_pos": L,
+                           "n_match": L - (1 if L > 2 else 0),
+                           "mismatch_head16": ([{"pos": L - 1, "gap": 0.1}]
+                                               if L > 2 else [])}
+    save_file(tensors, str(tmp_path / "shard_00000.safetensors"))
+    import json as _j
+    _j.dump({"shard_size": 256, "samples": samples},
+            open(tmp_path / "ctx_manifest.json", "w"))
+    return tmp_path
+
+
+def test_short_sample_filter_and_no_crash(tmp_path):
+    from data.ctx_dataset import CtxShardDataset
+    d = _fake_cache(tmp_path)
+    ds = CtxShardDataset(str(d))
+    assert ds.filtered_short == [0]          # L=1 dropped, counted
+    assert ds.indices == [1, 2]              # L=2 kept (1 legal anchor)
+    batch = collate_packed([ds[0], ds[1]], block_size=4, alpha=2.0,
+                           max_anchors=8, seed=43, epoch=0)
+    assert batch["valid_noise"].any()
+    # collate on an L<2 item (filter bypassed) must trip the K=0 assert
+    bad = {"ids": torch.arange(11), "ctx": torch.zeros(5, 11, 8),
+           "spans": torch.tensor([0, 0, 0, 10, 10, 11]), "meta": {"idx": 99}}
+    with pytest.raises(AssertionError, match="K=0"):
+        collate_packed([bad], 4, 2.0, 8, seed=43, epoch=0)
+
+
+# ------------------------------------------------------- F2: val split ------
+def test_val_split_deterministic_disjoint_500():
+    from train.train_drafter import make_val_split
+    all_idx = list(range(0, 34999, 7))
+    t1, v1 = make_val_split(all_idx, 43, 500)
+    t2, v2 = make_val_split(all_idx, 43, 500)
+    assert v1 == v2 and t1 == t2             # deterministic
+    assert len(v1) == 500
+    assert set(t1).isdisjoint(v1)
+    assert sorted(t1 + v1) == all_idx        # partition, train hard-excludes val
+
+
+# ---------------------------------------------- F3: anchor reproducibility --
+def _syn_item(idx, P=20, T=60):
+    return {"ids": torch.arange(T), "ctx": torch.zeros(5, T, 8),
+            "spans": torch.tensor([2, 6, 0, P, P, T]), "meta": {"idx": idx}}
+
+
+def test_anchor_rng_derivation():
+    kw = dict(block_size=4, alpha=1.0, max_anchors=16)
+    b_e0a = collate_packed([_syn_item(7)], seed=43, epoch=0, **kw)
+    b_e0b = collate_packed([_syn_item(7)], seed=43, epoch=0, **kw)
+    b_e1 = collate_packed([_syn_item(7)], seed=43, epoch=1, **kw)
+    b_other = collate_packed([_syn_item(8)], seed=43, epoch=0, **kw)
+    assert torch.equal(b_e0a["noise_pos"], b_e0b["noise_pos"])   # re-entrant
+    assert not torch.equal(b_e0a["noise_pos"], b_e1["noise_pos"])  # epoch moves
+    assert not torch.equal(b_e0a["noise_pos"], b_other["noise_pos"])  # idx moves
+    # val convention: epoch pinned to 0 -> identical across "epochs" by constr.
+    assert torch.equal(
+        collate_packed([_syn_item(7)], seed=43, epoch=0, **kw)["noise_pos"],
+        b_e0a["noise_pos"])
+
+
+# ------------------------------------------- F5/门4: load fidelity (CPU) ----
+def test_eval_only_load_fidelity_cpu(tmp_path):
+    from train.train_drafter import (TrainConfig, build_drafter, save_drafter,
+                                     slot_weights_like, weighted_ce)
+    cfg = TrainConfig(hidden_size=64, intermediate_size=128,
+                      num_attention_heads=4, num_key_value_heads=2,
+                      head_dim=16, num_hidden_layers=2, vocab_size=256,
+                      num_target_layers=8, block_size=4)
+    torch.manual_seed(1)
+    model = build_drafter(cfg).float()
+    # quantize once through the checkpoint dtype so save->load is lossless
+    model.load_state_dict({k: v.to(torch.bfloat16).float()
+                           for k, v in model.state_dict().items()})
+    lm_head = torch.nn.Linear(64, 256, bias=False).requires_grad_(False)
+    ids = torch.arange(40, 60)
+    packed = pack_blocks(ids, [8, 12], 4, mask_token_id=250)
+    allow = allowed_bool_mask(packed.anchor_pos, packed.block_of, 20, 8)
+    am = additive_4d(allow, torch.float32)
+    pos = torch.cat([torch.arange(20), packed.noise_pos])[None]
+    ctx = torch.randn(1, 20, len(model.target_layer_ids) * 64)
+
+    def val_ce(m):
+        with torch.no_grad():
+            out = m(position_ids=pos, attention_mask=am,
+                    noise_embedding=torch.randn(0).new_zeros(1, 8, 64) + 0.1,
+                    target_hidden=ctx, is_causal=False)
+            logits = lm_head(out)
+        labels = packed.labels[None].clamp(max=255)
+        w = slot_weights_like(labels, 4, 7.0)
+        return float(weighted_ce(logits, labels, w))
+
+    ce_before = val_ce(model)
+    save_drafter(model, cfg, tmp_path, "best", step=1)
+    ck = torch.load(tmp_path / "drafter_best.pt", map_location="cpu",
+                    weights_only=True)
+    model2 = build_drafter(cfg).float()
+    model2.load_state_dict(ck["state_dict"])
+    ce_after = val_ce(model2)
+    assert ce_before == ce_after             # bitwise identical on CPU

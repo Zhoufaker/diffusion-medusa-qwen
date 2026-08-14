@@ -1,7 +1,17 @@
 #!/bin/bash
-# W2 smoke training TEMPLATE — NOT authorized to submit.
-# 训练作业一律必审（CLAUDE.md 分级审查）：发预算过审后才可 qsub。
-# Smoke shape: --limit 500 (pilot range) x 1 epoch on 1xA100.
+# W2 smoke training — 审查修订后版本。前置：全量抽取 176267512 完成且
+# 门 1 复验通过（哨兵确认）；修订全绿后可直接 qsub（用户已预授权）。
+#
+# Smoke 六门（报告模板同此清单）：
+#   门1 训练 500 步 weighted CE 趋势线斜率为负
+#   门2 首 batch fp32 sdpa-vs-eager max|Δ|<1e-4 + hidden 形状/有限性断言
+#       （train_drafter.py --self-check 内嵌执行,失败即 abort）
+#   门3 显存峰值 vs 预估 28-30G 偏差 <30%；吞吐实测记录
+#   门4 --eval-only 加载保真度：best 档 val CE 复现差 <1e-3
+#       （训练收尾内嵌 reload 复验,写 train_summary.json gate4 字段）
+#   门5 off-policy 聚合 vs manifest 直算一致（含 decile 断言,--self-check 内嵌）
+#   门6 哨兵 JSON + 邮件到位
+# 训练集口径（F2）：前 2000 条非 val 索引 × 1 epoch；val = seed43 固定 500 条。
 #PBS -P li96
 #PBS -q dgxa100
 #PBS -l ncpus=16
@@ -26,13 +36,26 @@ export TRANSFORMERS_OFFLINE=1
 export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
 
 cd /home/562/mz9869/medusa-qwen
+OUT=/scratch/li96/mz9869/dflash_data/drafter_ckpt_smoke
 echo "=== W2 smoke train $(date) commit $(git rev-parse --short HEAD) ==="
 python train/train_drafter.py \
     --cache-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k \
-    --limit 500 --epochs 1 \
-    --out-dir /scratch/li96/mz9869/dflash_data/drafter_ckpt_smoke
+    --limit 2000 --epochs 1 --self-check \
+    --out-dir ${OUT}
 RC=$?
-echo "{\"job\":\"${PBS_JOBID}\",\"kind\":\"w2_smoke_train\",\"exit\":${RC},\"out\":\"drafter_ckpt_smoke\"}" \
-  > /scratch/li96/mz9869/dflash_data/drafter_ckpt_smoke_JOB_DONE_${PBS_JOBID%%.*}.json
+python - <<PYEOF
+import json
+s = {"job": "${PBS_JOBID}", "kind": "w2_smoke_train", "exit": ${RC}}
+try:
+    t = json.load(open("${OUT}/train_summary.json"))
+    s.update(best_val_ce=t["best_val_ce"],
+             peak_gpu_mem_gib=t["peak_gpu_mem_gib"],
+             gate4_load_fidelity_abs_diff=t["gate4_load_fidelity_abs_diff"],
+             gate4_pass=t["gate4_pass"], train_wall_s=t["train_wall_s"])
+except Exception as e:
+    s["summary_error"] = str(e)[:200]
+json.dump(s, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"))
+print("sentinel:", s)
+PYEOF
 echo "=== DONE $(date) rc=${RC} ==="
 exit ${RC}

@@ -59,8 +59,8 @@ class TrainConfig:
     batch_seqs: int = 4
     grad_accum: int = 1
     seed: int = 42
-    save_every_steps: int = 2000
-    val_fraction: float = 0.02
+    data_seed: int = 43           # F2/F3: val split + anchor rng derivation
+    val_size: int = 500           # F2: fixed 500-index val, seed=43, on-disk
     mask_token_id: int = MASK_TOKEN_ID
     # drafter architecture (design §3.1/§3.2: Qwen3-structure drafter with
     # Qwen2.5-VL-7B dimensions; independent model, not a target-layer clone)
@@ -154,6 +154,17 @@ def slot_weights_like(labels: torch.Tensor, block_size: int,
     return full
 
 
+def make_val_split(all_indices: list[int], data_seed: int,
+                   val_size: int) -> tuple[list[int], list[int]]:
+    """F2: val = fixed `val_size` indices drawn seed-deterministically from
+    the full (post-filter) index list; train = hard-excluded remainder."""
+    rng = random.Random(data_seed)
+    val = sorted(rng.sample(all_indices, min(val_size, len(all_indices))))
+    vset = set(val)
+    train = [i for i in all_indices if i not in vset]
+    return train, val
+
+
 def offpolicy_stats(metas: list[dict]) -> dict:
     """§1f aggregation: exact share from n_match/n_pos, positional detail
     from mismatch_head16 (approximate; truncation coverage reported)."""
@@ -227,6 +238,68 @@ def save_drafter(model, cfg: TrainConfig, out: Path, tag: str, step: int):
                 "step": step}, out / f"drafter_{tag}.pt")
 
 
+def self_check(model, embed, lm_head, val_loader, cfg: TrainConfig, device,
+               ds: CtxShardDataset, val_idx: list[int]) -> dict:
+    """Smoke 门 2+5 (design §1c dual path / §1f plumbing).
+
+    门2: first val batch through the model twice in fp32 (sdpa vs eager),
+    max |Δhidden| < 1e-4, plus shape/finiteness asserts.
+    门5: offpolicy_stats over the full val set == direct recomputation from
+    the manifest (share + decile histogram).
+    """
+    batch = next(iter(val_loader))
+    noise_emb = embed(batch["noise_ids"].to(device)).float()
+    ctx = batch["ctx"].to(device).float()
+    Bs, five, T, H = ctx.shape
+    ctx_flat = ctx.permute(0, 2, 1, 3).reshape(Bs, T, five * H)
+    allow = batch["allow"].to(device)
+    amask = torch.where(allow.unsqueeze(1), 0.0, torch.finfo(torch.float32).min)
+    outs = {}
+    orig_impl = model.config._attn_implementation
+    orig_dtype = next(model.parameters()).dtype
+    model_fp32 = model.float()
+    with torch.no_grad():
+        for impl in ("sdpa", "eager"):
+            model_fp32.config._attn_implementation = impl
+            outs[impl] = model_fp32(
+                position_ids=batch["position_ids"].to(device),
+                attention_mask=amask.float(),
+                noise_embedding=noise_emb,
+                target_hidden=ctx_flat,
+                is_causal=False)
+    model.config._attn_implementation = orig_impl
+    model.to(orig_dtype)
+    diff = float((outs["sdpa"] - outs["eager"]).abs().max())
+    expect_shape = (Bs, batch["noise_ids"].shape[1], cfg.hidden_size)
+    assert tuple(outs["sdpa"].shape) == expect_shape, \
+        f"hidden shape {tuple(outs['sdpa'].shape)} != {expect_shape}"
+    assert torch.isfinite(outs["sdpa"]).all(), "non-finite hidden (sdpa)"
+    gate2 = diff < 1e-4
+    # 门5: aggregation vs manifest direct recompute (metas straight off manifest)
+    metas = [{"idx": i, "n_match": ds.samples[i]["n_match"],
+              "n_pos": ds.samples[i]["n_pos"],
+              "mismatch_pos": [e["pos"] for e in ds.samples[i].get("mismatch_head16", [])],
+              "L": ds.samples[i]["L"]} for i in val_idx]
+    agg = offpolicy_stats(metas)
+    tot = sum(ds.samples[i]["n_pos"] for i in val_idx)
+    match = sum(ds.samples[i]["n_match"] for i in val_idx)
+    direct_share = 1.0 - match / max(1, tot)
+    from collections import defaultdict as _dd
+    direct_dec = _dd(int)
+    for i in val_idx:
+        L = ds.samples[i]["L"]
+        for e in ds.samples[i].get("mismatch_head16", []):
+            direct_dec[min(9, int(10 * e["pos"] / max(1, L)))] += 1
+    gate5 = (abs(agg["offpolicy_share_exact"] - direct_share) < 1e-12
+             and agg["mismatch_decile_head16"] == dict(sorted(direct_dec.items())))
+    res = {"gate2_sdpa_eager_max_abs_diff": diff, "gate2_pass": gate2,
+           "gate5_offpolicy_share": agg["offpolicy_share_exact"],
+           "gate5_pass": gate5}
+    print(f"[self-check] {res}", flush=True)
+    assert gate2 and gate5, f"self-check failed: {res}"
+    return res
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cache-dir", default="/scratch/li96/mz9869/dflash_data/ctx_cache_35k")
@@ -236,8 +309,15 @@ def main() -> int:
                     "cc594898137f460bfe9f0759e9844b3ce807cfb5")
     ap.add_argument("--lm-head", default="/scratch/li96/mz9869/medusa_assets/base_lm_head.safetensors")
     ap.add_argument("--out-dir", default="/scratch/li96/mz9869/dflash_data/drafter_ckpt")
-    ap.add_argument("--limit", type=int, default=None, help="smoke: cap samples")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="cap TRAIN set to first N non-val indices (F2 smoke)")
     ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--init-from", default=None,
+                    help="F5: load a drafter checkpoint before training/eval")
+    ap.add_argument("--eval-only", action="store_true",
+                    help="F5: run the fixed val epoch only, write JSON, exit")
+    ap.add_argument("--self-check", action="store_true",
+                    help="run 门2/门5 asserts before training")
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
@@ -245,29 +325,57 @@ def main() -> int:
     if args.epochs is not None:
         cfg.epochs = args.epochs
     torch.manual_seed(cfg.seed)
-    rng = random.Random(cfg.seed)
     device = torch.device(args.device)
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
 
     ds = CtxShardDataset(args.cache_dir, args.manifest_name)
-    idxs = ds.indices[: args.limit] if args.limit else ds.indices
-    n_val = max(1, int(len(idxs) * cfg.val_fraction))
-    train_idx, val_idx = idxs[:-n_val], idxs[-n_val:]
+    train_idx, val_idx = make_val_split(ds.indices, cfg.data_seed, cfg.val_size)
+    json.dump(val_idx, open(out / "val_indices.json", "w"))
+    if args.limit:
+        train_idx = train_idx[: args.limit]
+    json.dump({"n_filtered_short_L_lt_2": len(ds.filtered_short),
+               "filtered_short_indices": ds.filtered_short,
+               "n_train": len(train_idx), "n_val": len(val_idx),
+               "val_file": "val_indices.json", "limit": args.limit,
+               "config": dataclasses.asdict(cfg)},
+              open(out / "train_manifest.json", "w"), indent=1)
+
     mk = lambda sub: CtxShardDataset(args.cache_dir, args.manifest_name, indices=sub)  # noqa: E731
-    coll = lambda items: collate_packed(  # noqa: E731
-        items, cfg.block_size, cfg.alpha, cfg.max_anchors, rng)
-    train_loader = torch.utils.data.DataLoader(
-        mk(train_idx), batch_size=cfg.batch_seqs, shuffle=True,
-        collate_fn=coll, num_workers=0)
+    def coll(epoch: int):
+        return lambda items: collate_packed(
+            items, cfg.block_size, cfg.alpha, cfg.max_anchors,
+            cfg.data_seed, epoch)
+    def train_loader_for(epoch: int):
+        return torch.utils.data.DataLoader(
+            mk(train_idx), batch_size=cfg.batch_seqs, shuffle=True,
+            collate_fn=coll(epoch), num_workers=0)
+    # F3: val pins epoch=0 -> fixed anchors across all evaluations
     val_loader = torch.utils.data.DataLoader(
         mk(val_idx), batch_size=cfg.batch_seqs, shuffle=False,
-        collate_fn=coll, num_workers=0)
+        collate_fn=coll(0), num_workers=0)
 
     model = build_drafter(cfg).to(device)
     model.gradient_checkpointing_enable()
     embed, lm_head = load_frozen_embed_lmhead(
         cfg, args.hf_snapshot, args.lm_head, device, torch.bfloat16)
+    if args.init_from:
+        ck = torch.load(args.init_from, map_location="cpu", weights_only=True)
+        model.load_state_dict(ck["state_dict"])
+        print(f"[setup] loaded drafter from {args.init_from} "
+              f"(step {ck.get('step')})", flush=True)
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[setup] drafter trainable params: {n_trainable/1e9:.3f}B", flush=True)
+
+    if args.self_check:
+        self_check(model, embed, lm_head, val_loader, cfg, device, ds, val_idx)
+
+    if args.eval_only:
+        with torch.no_grad():
+            va = run_epoch(model, embed, lm_head, val_loader, cfg, device)
+        json.dump(va, open(out / "eval_only.json", "w"), indent=1)
+        print(f"[eval-only] val {va['mean_loss']:.6f}", flush=True)
+        return 0
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
                                   weight_decay=cfg.weight_decay)
@@ -281,12 +389,12 @@ def main() -> int:
         return 0.5 * (1 + math.cos(math.pi * prog))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    out = Path(args.out_dir)
     best = float("inf")
     gstep = 0
+    t_train0 = time.time()
     for ep in range(cfg.epochs):
-        tr = run_epoch(model, embed, lm_head, train_loader, cfg, device,
-                       optimizer, scheduler)
+        tr = run_epoch(model, embed, lm_head, train_loader_for(ep), cfg,
+                       device, optimizer, scheduler)
         with torch.no_grad():
             va = run_epoch(model, embed, lm_head, val_loader, cfg, device)
         gstep += steps_per_epoch
@@ -298,6 +406,25 @@ def main() -> int:
             save_drafter(model, cfg, out, "best", gstep)
         json.dump({"epoch": ep, "train": tr, "val": va},
                   open(out / f"epoch_{ep}_stats.json", "w"), indent=1)
+
+    # 门4 load fidelity: reload best checkpoint, rerun fixed val, |ΔCE|<1e-3
+    ck = torch.load(out / "drafter_best.pt", map_location="cpu",
+                    weights_only=True)
+    model.load_state_dict(ck["state_dict"])
+    with torch.no_grad():
+        va2 = run_epoch(model, embed, lm_head, val_loader, cfg, device)
+    fidelity = abs(va2["mean_loss"] - best)
+    peak_gb = (torch.cuda.max_memory_allocated() / 2**30
+               if torch.cuda.is_available() else 0.0)
+    summary = {"best_val_ce": best, "reloaded_val_ce": va2["mean_loss"],
+               "gate4_load_fidelity_abs_diff": fidelity,
+               "gate4_pass": fidelity < 1e-3,
+               "peak_gpu_mem_gib": round(peak_gb, 2),
+               "total_steps": gstep, "epochs": cfg.epochs,
+               "train_wall_s": round(time.time() - t_train0, 1),
+               "n_train": len(train_idx), "n_val": len(val_idx)}
+    json.dump(summary, open(out / "train_summary.json", "w"), indent=1)
+    print(f"[summary] {summary}", flush=True)
     return 0
 
 
