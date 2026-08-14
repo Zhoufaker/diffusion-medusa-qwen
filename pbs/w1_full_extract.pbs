@@ -1,0 +1,55 @@
+#!/bin/bash
+# W1 全量抽取: 34,999 条 5-layer ctx feature -> 正式缓存 ctx_cache_35k/.
+# 预授权条件已满足（Arm1=100% 管线无罪; 新门1 determinism byte-identical）。
+# 收尾内嵌新门 1 复验：本次 shard_00000 必须与 pilot 逐字节一致。
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=100GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N w1_full_extract
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+export EXTRACT_HARDWARE_TAG=A100-dgxa100
+
+cd /home/562/mz9869/medusa-qwen
+echo "=== W1 FULL extract $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/extract_ctx_features.py \
+    --start-idx 0 \
+    --out-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k \
+    --manifest-name ctx_manifest.json
+RC=$?
+H1=$(sha256sum /scratch/li96/mz9869/dflash_data/ctx_cache_35k_pilot/shard_00000.safetensors | awk '{print $1}')
+H2=$(sha256sum /scratch/li96/mz9869/dflash_data/ctx_cache_35k/shard_00000.safetensors | awk '{print $1}')
+SAME=$([ "$H1" = "$H2" ] && echo true || echo false)
+echo "gate1 determinism vs pilot shard_00000: $SAME"
+python - <<PYEOF
+import json
+m = json.load(open("/scratch/li96/mz9869/dflash_data/ctx_cache_35k/ctx_manifest.json"))
+a = m["aggregate"]
+s = {"job": "${PBS_JOBID}", "exit": ${RC}, "gate1_shard0_byte_identical": ${SAME},
+     "n_done": a["n_done"], "n_failed": a["n_failed"],
+     "drift_register_pos_match_vs_v100_incremental": a["pos_match_rate"],
+     "sample_exact_rate": a["sample_exact_rate"],
+     "throughput_samples_per_min": round(a["throughput_samples_per_min"], 1),
+     "peak_gpu_mem_gib": a["peak_gpu_mem_gib"],
+     "out": "/scratch/li96/mz9869/dflash_data/ctx_cache_35k"}
+json.dump(s, open("/scratch/li96/mz9869/dflash_data/ctx_cache_35k/JOB_DONE_${PBS_JOBID%%.*}.json", "w"))
+print("sentinel:", s)
+PYEOF
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}

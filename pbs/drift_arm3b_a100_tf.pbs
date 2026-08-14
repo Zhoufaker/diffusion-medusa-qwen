@@ -1,0 +1,40 @@
+#!/bin/bash
+# 2x2 drift attribution — Arm3b: A100 + full-seq TF, same 50-index panel,
+# audit-only (saves tf_preds.pt so Arm3vs4 pairwise cells are exact, not
+# position-set bounds; Arm3 pilot 500-sample rates stay as the vs-old figure).
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=100GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N drift_arm3b
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+export EXTRACT_HARDWARE_TAG=A100-dgxa100
+
+cd /home/562/mz9869/medusa-qwen
+echo "=== drift Arm3b A100+TF panel $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/extract_ctx_features.py \
+    --audit-only \
+    --index-file /scratch/li96/mz9869/dflash_data/drift_exp/sample_indices.json \
+    --out-dir /scratch/li96/mz9869/dflash_data/drift_exp/arm3b_a100_tf \
+    --manifest-name arm3b_manifest.json
+RC=$?
+echo "{\"job\":\"${PBS_JOBID}\",\"arm\":\"arm3b_a100_tf\",\"exit\":${RC}}" \
+  > /scratch/li96/mz9869/dflash_data/drift_exp/JOB_DONE_${PBS_JOBID%%.*}.json
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}

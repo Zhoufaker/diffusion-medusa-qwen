@@ -132,7 +132,8 @@ def find_vision_span(ids: torch.Tensor, image_pad_id: int) -> tuple[int, int]:
 
 
 @torch.no_grad()
-def extract_one(base, spec: dict, inputs, old_tokens: torch.Tensor, device: str):
+def extract_one(base, spec: dict, inputs, old_tokens: torch.Tensor, device: str,
+                audit_only: bool = False):
     """Teacher-forcing forward over prompt + rollout; returns tensors + audit."""
     prompt_ids = inputs["input_ids"]                       # (1, P)
     P = prompt_ids.shape[1]
@@ -163,10 +164,11 @@ def extract_one(base, spec: dict, inputs, old_tokens: torch.Tensor, device: str)
         for j in (~match).nonzero(as_tuple=True)[0][:16].tolist():
             gap = float(logits[j, pred[j]] - logits[j, exp[j]])
             mismatch.append({"pos": j, "gap": round(gap, 6)})
-    ctx_cpu = ctx.to("cpu", torch.bfloat16).contiguous()
+    ctx_cpu = None if audit_only else ctx.to("cpu", torch.bfloat16).contiguous()
     ids_cpu = full_ids[0].to("cpu", torch.int64).contiguous()
+    pred_cpu = pred.to("cpu", torch.int64) if audit_only else None
     del out, ctx, logits
-    return ctx_cpu, ids_cpu, P, L, n_match, mismatch
+    return ctx_cpu, ids_cpu, P, L, n_match, mismatch, pred_cpu
 
 
 def flush_shard(out_dir: Path, shard_id: int, buf: dict, partial: bool) -> str:
@@ -191,9 +193,14 @@ def main() -> int:
     ap.add_argument("--end-idx", type=int, default=None, help="exclusive; default = all")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--manifest-name", default="ctx_manifest.json")
+    ap.add_argument("--index-file", default=None,
+                    help="JSON list of indices; overrides --start/--end-idx")
+    ap.add_argument("--audit-only", action="store_true",
+                    help="no feature shards; save per-sample TF pred sequences")
     args = ap.parse_args()
 
-    assert args.start_idx % SHARD_SIZE == 0, "start-idx must be shard-aligned"
+    if not (args.index_file or args.audit_only):
+        assert args.start_idx % SHARD_SIZE == 0, "start-idx must be shard-aligned"
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     prompts = json.load(open(args.prompts))
@@ -206,14 +213,17 @@ def main() -> int:
     spec = freeze_preprocess_spec(processor)
     image_pad_id = spec["image_pad_token_id"]
 
+    indices = (json.load(open(args.index_file)) if args.index_file
+               else list(range(args.start_idx, end)))
     records: dict[str, dict] = {}
     shard_names: dict[int, str] = {}
     buf: dict[int, tuple] = {}
+    preds_out: dict[int, torch.Tensor] = {}
     n_pos_total = n_match_total = n_sample_exact = n_done = n_failed = 0
     t0 = time.time()
     tok_count = 0
 
-    for i in range(args.start_idx, end):
+    for i in indices:
         shard_id = i // SHARD_SIZE
         p = prompts[i]
         img = images_dir / p["image"]
@@ -222,8 +232,9 @@ def main() -> int:
             old_tokens = old["tokens"]
             sha = hashlib.sha256(old_tokens.numpy().tobytes()).hexdigest()
             inputs = make_image_inputs(processor, p["question"], img, args.device)
-            ctx, ids, P, L, n_match, mismatch = extract_one(
-                base, spec, inputs, old_tokens, args.device
+            ctx, ids, P, L, n_match, mismatch, pred = extract_one(
+                base, spec, inputs, old_tokens, args.device,
+                audit_only=args.audit_only,
             )
         except Exception as e:  # noqa: BLE001 — per-sample fault isolation, counted + gated below
             n_failed += 1
@@ -232,7 +243,10 @@ def main() -> int:
             continue
         vs, ve = find_vision_span(ids[:P], image_pad_id)
         spans = torch.tensor([vs, ve, 0, P, P, P + L], dtype=torch.int64)
-        buf[i] = (ctx, ids, spans)
+        if args.audit_only:
+            preds_out[i] = pred
+        else:
+            buf[i] = (ctx, ids, spans)
         records[str(i)] = {
             "idx": i, "shard": shard_id, "T": P + L, "P": P, "L": L,
             "spans": {"vision": [vs, ve], "prompt": [0, P], "rollout": [P, P + L]},
@@ -244,7 +258,7 @@ def main() -> int:
         n_sample_exact += int(n_match == L)
         n_done += 1
         tok_count += P + L
-        if (i + 1) % SHARD_SIZE == 0 or (i + 1) == end:
+        if not args.audit_only and ((i + 1) % SHARD_SIZE == 0 or (i + 1) == end):
             partial = (i + 1) % SHARD_SIZE != 0 or (i % SHARD_SIZE + 1) != len(buf)
             shard_names[shard_id] = flush_shard(out_dir, shard_id, buf, partial)
             buf = {}
@@ -269,9 +283,17 @@ def main() -> int:
         "peak_gpu_mem_gib": round(peak_gb, 2),
         "wall_s": round(dt, 1),
     }
+    if args.audit_only and preds_out:
+        torch.save(preds_out, out_dir / "tf_preds.pt")
     manifest = {
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "code_commit": git_commit_hash(),
+        "hardware": os.environ.get(
+            "EXTRACT_HARDWARE_TAG",
+            torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+        ),
+        "audit_only": bool(args.audit_only),
+        "index_file": args.index_file,
         "range": [args.start_idx, end], "total_prompts": total,
         "shard_size": SHARD_SIZE, "shards": shard_names,
         "preprocess_spec": spec, "near_tie_gap": NEAR_TIE_GAP,

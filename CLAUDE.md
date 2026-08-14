@@ -24,6 +24,16 @@
   自蒸馏谱系源头（rollout_prompts.json + 30,599 张 COCO 图像 +
   LLaVA-Instruct 源 json），是 W1 特征抽取的直接输入。锁定至全量
   抽取+审计通过，期间禁止移动/删除/重命名。冷备 tar 已在 archives/。
+- ctx_cache_35k 审计基准（2026-08-14 经 2×2 归因实验重定义，
+  实验记录 reports/drift_attribution_report.md）：
+  - 门 1【抽取确定性】：同卡同代码重跑 shard_00000 与 pilot 逐字节一致
+    （sha256）。已过：05b8b6b7… 双跑一致
+  - 门 2【漂移登记】：对 V100 增量基准的位置级一致率如实记录进 manifest
+    （pilot 实测 95.93%），不设通过线
+  - 已废止：原 99.5%/99.9% 对旧缓存的 exactness 门。理由：Arm1
+    （V100+增量、原脚本原样）对旧缓存 100.000% 复现，证明管线无罪；
+    4.07% 漂移 = 前向形态（增量 vs 整序列 ~3.9%）+ 硬件（V100→A100
+    ~0.16%）的 fp16 数值差，非 bug，不可能通过原门，也无需通过
 
 ## 对比 baseline 数值（旧线冠军，只引用不重测；v2 口径）
 - 速度基线（v2 e2e paired，ARCHIVE_POLICY_V2_ANCHOR 2026-08-07）：
