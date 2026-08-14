@@ -1,0 +1,52 @@
+# PROPOSED diff for scripts/extract_ctx_features.py — Arm4 (V100 + 整序列 TF)
+# 目的：--index-file 跑 50 条固定 panel；--audit-only 只做 argmax 审计 + 保存
+# 每条完整 pred 序列（供四臂两两矩阵精确计算），不写 feature 分片（省 ~90% IO）。
+# 状态：未应用。extract_ctx_features.py 被 w1_rerun256 排队作业冻结，
+# 等该作业结束 + 你确认本 diff 后应用并提交。
+#
+--- a/scripts/extract_ctx_features.py
++++ b/scripts/extract_ctx_features.py
+@@ def extract_one(...)
+-def extract_one(base, spec: dict, inputs, old_tokens: torch.Tensor, device: str):
++def extract_one(base, spec: dict, inputs, old_tokens: torch.Tensor, device: str,
++                audit_only: bool = False):
+     ...
+     pred = logits.argmax(-1)                               # (L,)
+     ...
+-    ctx_cpu = ctx.to("cpu", torch.bfloat16).contiguous()
++    ctx_cpu = None if audit_only else ctx.to("cpu", torch.bfloat16).contiguous()
+     ids_cpu = full_ids[0].to("cpu", torch.int64).contiguous()
++    pred_cpu = pred.to("cpu", torch.int64) if audit_only else None
+     del out, ctx, logits
+-    return ctx_cpu, ids_cpu, P, L, n_match, mismatch
++    return ctx_cpu, ids_cpu, P, L, n_match, mismatch, pred_cpu
+@@ main() argparse
++    ap.add_argument("--index-file", default=None,
++                    help="JSON list of indices; overrides --start/--end-idx")
++    ap.add_argument("--audit-only", action="store_true",
++                    help="no feature shards; save per-sample pred token sequences")
+@@ main() index iteration
+-    assert args.start_idx % SHARD_SIZE == 0, "start-idx must be shard-aligned"
++    if not (args.index_file or args.audit_only):
++        assert args.start_idx % SHARD_SIZE == 0, "start-idx must be shard-aligned"
++    indices = (json.load(open(args.index_file)) if args.index_file
++               else range(args.start_idx, end))
+-    for i in range(args.start_idx, end):
++    preds_out = {}
++    for i in indices:
+@@ main() loop body（audit-only 分支）
+-            ctx, ids, P, L, n_match, mismatch = extract_one(...)
++            ctx, ids, P, L, n_match, mismatch, pred = extract_one(
++                base, spec, inputs, old_tokens, args.device,
++                audit_only=args.audit_only)
+         ...
+-        buf[i] = (ctx, ids, spans)
++        if args.audit_only:
++            preds_out[i] = pred
++        else:
++            buf[i] = (ctx, ids, spans)
+         # shard flush 块整体套在 if not args.audit_only 内
+@@ main() 收尾
++    if args.audit_only and preds_out:
++        torch.save(preds_out, out_dir / "tf_preds.pt")
+# manifest 照常写（records 含逐条 n_match/mismatch），文件名由 --manifest-name 区分

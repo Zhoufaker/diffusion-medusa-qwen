@@ -1,0 +1,37 @@
+#!/bin/bash
+# 2x2 drift attribution — Arm2: A100 + incremental rollout.
+# Same UNMODIFIED gen_cache_rollout.py + dummy-skip subset as Arm1; only the
+# queue/hardware differs (isolates pure hardware effect on the AR path).
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=100GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N drift_arm2
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+cd /home/562/mz9869/medusa-qwen
+echo "=== drift Arm2 A100+inc $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/gen_cache_rollout.py \
+    --out-dir /scratch/li96/mz9869/dflash_data/drift_exp/arm2_a100_inc \
+    --limit 500
+RC=$?
+echo "{\"job\":\"${PBS_JOBID}\",\"arm\":\"arm2_a100_inc\",\"exit\":${RC},\"out\":\"drift_exp/arm2_a100_inc\"}" \
+  > /scratch/li96/mz9869/dflash_data/drift_exp/JOB_DONE_${PBS_JOBID%%.*}.json
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}
