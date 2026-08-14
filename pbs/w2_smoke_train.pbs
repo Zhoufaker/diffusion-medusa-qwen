@@ -1,0 +1,38 @@
+#!/bin/bash
+# W2 smoke training TEMPLATE — NOT authorized to submit.
+# 训练作业一律必审（CLAUDE.md 分级审查）：发预算过审后才可 qsub。
+# Smoke shape: --limit 500 (pilot range) x 1 epoch on 1xA100.
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=150GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=01:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N w2_smoke_train
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+cd /home/562/mz9869/medusa-qwen
+echo "=== W2 smoke train $(date) commit $(git rev-parse --short HEAD) ==="
+python train/train_drafter.py \
+    --cache-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k \
+    --limit 500 --epochs 1 \
+    --out-dir /scratch/li96/mz9869/dflash_data/drafter_ckpt_smoke
+RC=$?
+echo "{\"job\":\"${PBS_JOBID}\",\"kind\":\"w2_smoke_train\",\"exit\":${RC},\"out\":\"drafter_ckpt_smoke\"}" \
+  > /scratch/li96/mz9869/dflash_data/drafter_ckpt_smoke_JOB_DONE_${PBS_JOBID%%.*}.json
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}
