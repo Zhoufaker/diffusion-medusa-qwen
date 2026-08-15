@@ -1,0 +1,71 @@
+#!/bin/bash
+# D2 G0a 代码保真门(协议 v1.1):V100 gpuvolta 上旧线回归门入口原样复跑
+# 臂② 冠军配置于 old-100,与 v2 参照 archive 字节级比对,失配即判负。
+# 免审档:v2_rebaseline_in_domain.pbs 已过审模板的单配置重跑
+# (仅改输入清单为 old-100 / 作业名 / 输出目录),预估 ~5 SU。
+#PBS -P li96
+#PBS -q gpuvolta
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=96GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N d2_g0a
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+OUT=/scratch/li96/mz9869/dflash_data/d2/g0a
+REF=/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/v2_rebaseline/dyn_k8_n24.spec_archive.json
+mkdir -p ${OUT}
+cd /home/562/mz9869/medusa-qwen
+echo "=== D2 G0a V100 $(date) commit $(git rev-parse --short HEAD) ==="
+
+# 冠军 flags 逐项对照 job 175598529 日志头;清单 = old-100(gate100 口径)
+python3 -u -m scripts.eval_acceptance_tree \
+    --tree-builder dynamic \
+    --ckpt /scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/ckpt_best.pt \
+    --mode tree --fold-bonus --reorg gather \
+    --n-prompts 100 --min-ref-words 80 --max-new-tokens 150 --seed 42 \
+    --check-greedy-bytes \
+    --manifest /scratch/li96/mz9869/eval_manifests/manifest_old100_gate.json \
+    --images-dir /g/data/li96/mz9869/data/coco_subset \
+    --fanout 1 8 8 8 8 --max-nodes 24 \
+    --out ${OUT}/g0a_dyn_k8_n24_old100.json \
+    --o0-write-archive ${OUT}/g0a_dyn_k8_n24_old100.spec_archive.json \
+    --o0-write-greedy-archive ${OUT}/g0a_dyn_k8_n24_old100.greedy_archive.json
+RC=$?
+
+python - <<PYEOF
+import json
+new = json.load(open("${OUT}/g0a_dyn_k8_n24_old100.spec_archive.json"))
+ref = json.load(open("${REF}"))
+rows, n_exact = [], 0
+for pid, toks in new.items():
+    ok = ref.get(pid) == toks
+    n_exact += ok
+    if not ok:
+        rows.append(pid)
+res = {"gate": "G0a_code_fidelity_v100", "job": "${PBS_JOBID}",
+       "exit": ${RC}, "n_prompts": len(new), "n_byte_exact": n_exact,
+       "pass": ${RC} == 0 and n_exact == len(new) and len(new) == 100,
+       "mismatch_ids": rows,
+       "ref_archive": "${REF}",
+       "new_archive": "${OUT}/g0a_dyn_k8_n24_old100.spec_archive.json"}
+json.dump(res, open("${OUT}/g0a_result.json", "w"), indent=1)
+json.dump(res, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"))
+print("G0a:", res["pass"], f"{n_exact}/{len(new)} byte-exact")
+PYEOF
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}

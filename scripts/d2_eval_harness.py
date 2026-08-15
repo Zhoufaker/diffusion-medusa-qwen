@@ -71,9 +71,9 @@ def main() -> int:
     ap.add_argument("--manifest", default="/scratch/li96/mz9869/eval_manifests/manifest_300.json")
     ap.add_argument("--images-dir", required=True,
                     help="COCO eval images dir (e.g. /g/data/li96/mz9869/data/coco_subset)")
-    ap.add_argument("--old100-manifest", default="/scratch/li96/mz9869/eval_manifests/manifest_old100_gate.json")
-    ap.add_argument("--byte-archive", default="/scratch/li96/mz9869/medusa_outputs/"
-                    "linked_medusa_c1_eagle/v2_rebaseline/dyn_k8_n24.spec_archive.json")
+    ap.add_argument("--g0a-result", required=True,
+                    help="G0a(V100 字节门)结果 JSON——协议 v1.1:harness 只读"
+                         "其结论,不在 A100 上重比字节")
     ap.add_argument("--tree-ckpt", default="/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/ckpt_best.pt")
     ap.add_argument("--drafter-ckpt", required=True)
     ap.add_argument("--hf-snapshot", default="/scratch/li96/mz9869/tmp_hf_download/hub/"
@@ -107,8 +107,7 @@ def main() -> int:
     images_dir = Path(args.images_dir)
     # 与冠军跑同参:min_ref_words=80, seed=42, ordered
     prompts = filter_prompts(args.manifest, 80, 42, ordered=True)[: args.n_prompts]
-    old100_ids = {e["id"] for e in json.load(open(args.old100_manifest))}
-    byte_archive = json.load(open(args.byte_archive))
+    g0a = json.load(open(args.g0a_result))
 
     def arm_ar(p):
         return vanilla_greedy(base, processor, p["question"],
@@ -177,20 +176,13 @@ def main() -> int:
     point, lo, hi = paired_bootstrap_ci(diffs)
     g1 = {"point": point, "ci95": [lo, hi], "pass": point > 0 and lo > 0,
           "marginal": lo <= 0 <= hi and point > 0}
-    # G0: old-100 byte gate(V100 archive 参照,失配逐条登记——协议附登记条款)
-    g0_rows = []
-    for r in scored:
-        if r["id"] in old100_ids and r["dyn_k8_n24"]["tokens"] is not None:
-            ref = byte_archive.get(r["id"])
-            g0_rows.append({"id": r["id"],
-                            "byte_exact": ref == r["dyn_k8_n24"]["tokens"]})
-    n_exact = sum(x["byte_exact"] for x in g0_rows)
-    g0 = {"old100_covered": len(g0_rows), "byte_exact": n_exact,
-          "hardware_branch": "V100->A100 migration, no numeric timing gate "
-                             "(protocol lock-in); byte mismatches reported "
-                             "verbatim for advisor ruling",
-          "tree_speedup_mean_new_baseline":
-              sum(r["speedup_tree"] for r in scored) / len(scored)}
+    # G0(协议 v1.1):G0a 结论从 V100 作业结果文件读入;G0b = A100 新基准
+    g0 = {"G0a": {"pass": bool(g0a.get("pass")), "source": args.g0a_result,
+                  "detail": {k: g0a.get(k) for k in
+                             ("n_prompts", "n_byte_exact", "job")}},
+          "G0b_tree_speedup_mean_new_baseline":
+              sum(r["speedup_tree"] for r in scored) / len(scored),
+          "sigma_batch_registered": 0.0537}
     # G2: 双跑一致
     g2_runs = []
     for r in scored[: args.g2_prompts]:
