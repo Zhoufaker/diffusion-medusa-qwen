@@ -48,9 +48,13 @@ python3 -u -m scripts.eval_acceptance_tree \
 RC=$?
 
 python - <<PYEOF
-import json
-new = json.load(open("${OUT}/g0a_dyn_k8_n24_old100.spec_archive.json"))
-ref = json.load(open("${REF}"))
+import json, sys
+sys.path.insert(0, "/home/562/mz9869/medusa-qwen")
+from decode.common import load_o0_archive
+# 注意:spec_archive 带包装结构,必须经 load_o0_archive 解析
+# (2026-08-15 首跑教训:直接当扁平 dict 读会拿到元数据键)
+new = load_o0_archive("${OUT}/g0a_dyn_k8_n24_old100.spec_archive.json")
+ref = load_o0_archive("${REF}")
 rows, n_exact = [], 0
 for pid, toks in new.items():
     ok = ref.get(pid) == toks
