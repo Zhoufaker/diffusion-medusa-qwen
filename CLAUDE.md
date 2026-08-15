@@ -48,15 +48,22 @@
 - 待办：冷藏项约 470–500G（非冠军 ckpt / smoke / v1 / phaseA）论文投稿后再清
   （本次判定：不删）
 - 长期资产 touch 名单（scratch 100 天 atime，定期访问防清除）：
-  - /scratch/li96/mz9869/archives/onpolicy_data_legacy.tar（5.3G，B2 数据冷备，
-    2026-08-13 建，三重验证通过；原散件目录暂保留——W1 抽取依赖其中
-    rollout_prompts.json 与 images/，删除待全量抽取完成后另行授权）
-  - （待办）llava_general_35k 旧缓存 tar 收编——同样等全量抽取+审计通过
+  - /scratch/li96/mz9869/archives/onpolicy_data_legacy.tar（5.3G，B2 数据冷备；
+    散件已删，2026-08-15 收编完成，README_MOVED 在原路径）
+  - /scratch/li96/mz9869/archives/llava_general_35k_legacy.tar（33.4G，旧线
+    自蒸馏缓存冷备，2026-08-15 三重验证后收编，散件已删）
+  - /scratch/li96/mz9869/archives/qwen25vl_long_v1cache.tar（~77G，v1 三头训练
+    缓存冷备，2026-08-15 验明正身后收编；原"新线资产"登记有误，实为 v1 缓存
+    ——见 w1_full_extract_report.md 附录）
+  - /scratch/li96/mz9869/dflash_data/ctx_cache_35k/（616G，训练期高频访问；
+    训练间歇期注意 atime）
 
 ## 工作纪律
 - 预注册优先：所有阈值、统计检验在数据到来前锁定
 - 单变量消融；训练算力花费前必须过代码审查
 - 任何对导师代码包内文件的操作一律先复制到本项目目录，原包只读
+- 目录名不是谱系证据——onpolicy_data 与 qwen25vl_long 两起误标事故的教训；
+  任何资产的处置决策前必须实物盘点
 
 ## PBS 作业分级审查规则
 - 免审（agent 按自查清单核对后可直接 qsub）：
