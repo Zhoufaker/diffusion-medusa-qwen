@@ -141,18 +141,19 @@ def main() -> int:
                                     "tokens": toks}
             elif a == 1:
                 tr, w = timed(lambda: arm_tree(p))
-                emitted = tr.get("emitted") or tr.get("emitted_tokens") or []
+                # v1.2/B2:严格键访问(KeyError 即崩,不静默降级)
                 rec["dyn_k8_n24"] = {"wall_s": w,
-                                     "n_tokens": (len(emitted) if isinstance(emitted, list)
-                                                  else int(emitted)),
-                                     "tokens": emitted if isinstance(emitted, list) else None,
-                                     "sigma": tr.get("sigma")}
+                                     "n_tokens": tr["total_emitted"],
+                                     "tokens": tr["emitted_tokens"],
+                                     "sigma": tr["sigma"]}
             else:
                 (seq, stats, d3), w = timed(lambda: arm_dflash(p))
                 rec["dflash_b16"] = {"wall_s": w, "n_tokens": len(seq),
                                      "tokens": seq, **{k: v for k, v in stats.items()
                                                        if k != "accept_lengths"}}
-                json.dump(d3, open(out / "d3" / f"{p['id']}.json", "w"))
+                json.dump({"warmup": i < args.warmup, "prompt_id": p["id"],
+                           "cycles": d3},
+                          open(out / "d3" / f"{p['id']}.json", "w"))
         # 跨臂匹配登记(协议 greedy 等价性声明)
         ta, td = rec["ar_greedy"]["tokens"], rec["dflash_b16"]["tokens"]
         n = min(len(ta), len(td))
@@ -165,13 +166,14 @@ def main() -> int:
             print(f"[d2] {i + 1}/{len(prompts)} done", flush=True)
 
     scored = [r for r in results if not r["warmup"]]
-    # G1: paired speedup difference (vs 臂① 同 prompt)
+    # G1(v1.2): per-token paired speedup:speedup_X = (t1/n1)/(tX/nX)
     diffs = []
     for r in scored:
-        t1, t2, t3 = (r["ar_greedy"]["wall_s"], r["dyn_k8_n24"]["wall_s"],
-                      r["dflash_b16"]["wall_s"])
-        r["speedup_tree"] = t1 / t2
-        r["speedup_dflash"] = t1 / t3
+        pt1 = r["ar_greedy"]["wall_s"] / max(1, r["ar_greedy"]["n_tokens"])
+        pt2 = r["dyn_k8_n24"]["wall_s"] / max(1, r["dyn_k8_n24"]["n_tokens"])
+        pt3 = r["dflash_b16"]["wall_s"] / max(1, r["dflash_b16"]["n_tokens"])
+        r["speedup_tree"] = pt1 / pt2
+        r["speedup_dflash"] = pt1 / pt3
         diffs.append(r["speedup_dflash"] - r["speedup_tree"])
     point, lo, hi = paired_bootstrap_ci(diffs)
     g1 = {"point": point, "ci95": [lo, hi], "pass": point > 0 and lo > 0,
@@ -198,7 +200,13 @@ def main() -> int:
     cross = {"exact_rate": sum(r["cross_arm"]["exact"] for r in scored) / len(scored),
              "div_sample_ids": [r["id"] for r in scored
                                 if not r["cross_arm"]["exact"]][:10]}
-    summary = {"n_scored": len(scored), "G0": g0, "G1": g1, "G2": g2,
+    import subprocess
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"],
+                                     cwd=_ROOT, text=True).strip()
+    summary = {"n_scored": len(scored), "code_commit": commit,
+               "g0a_job_id": g0a.get("job"),
+               "speedup_definition": "per-token (v1.2): (wall1/n1)/(wallX/nX)",
+               "G0": g0, "G1": g1, "G2": g2,
                "tau_accept_only": tau1, "tau_with_bonus": tau2,
                "tau_footnote": "DFlash τ=6.5 对照须带 35K vs 800K 数据折扣脚注",
                "cross_arm": cross,

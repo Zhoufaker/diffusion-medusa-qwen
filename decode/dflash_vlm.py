@@ -78,7 +78,9 @@ def dflash_vlm_generate(target, drafter, embed, lm_head, inputs,
     past_t = out.past_key_values
     past_d = DynamicCache()
     first = argmax_masked(out.logits[0, -1, :])
-    ctx = extract_ctx(out.hidden_states, layer_ids)          # (1, P, 5H)
+    # B1 谱系:训练特征 = target fp16 前向 → bf16 落盘;推理 ctx 同源地
+    # 经 bf16 再入 drafter,消除 fp16-ctx 与训练分布的 dtype 失配
+    ctx = extract_ctx(out.hidden_states, layer_ids).to(torch.bfloat16)  # (1,P,5H)
     del out
     torch.cuda.synchronize() if device.type == "cuda" else None
     prefill_s = time.perf_counter() - t0
@@ -130,7 +132,9 @@ def dflash_vlm_generate(target, drafter, embed, lm_head, inputs,
             })
         start += acc + 1
         past_t.crop(start)
-        ctx = extract_ctx(vout.hidden_states, layer_ids)[:, :acc + 1, :]
+        # B1 谱系:同上,verify 增量特征也走 bf16(与训练缓存 dtype 一致)
+        ctx = extract_ctx(vout.hidden_states,
+                          layer_ids)[:, :acc + 1, :].to(torch.bfloat16)
         accept_lengths.append(acc)
         del vout
         if eos_id in ids[0, P:start].tolist():

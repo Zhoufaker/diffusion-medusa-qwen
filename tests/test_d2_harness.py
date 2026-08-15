@@ -137,6 +137,43 @@ def test_latin_square_balance():
         assert all(slot_arm[s][a] == 100 for a in range(3))
 
 
+def test_drafter_exposes_target_layer_ids():
+    """适配器依赖 drafter.target_layer_ids(z-lab 属性)——小配置实例化断言。"""
+    from train.train_drafter import TrainConfig, build_drafter
+    from dflash.model import build_target_layer_ids
+    cfg = TrainConfig(hidden_size=64, intermediate_size=128,
+                      num_attention_heads=4, num_key_value_heads=2,
+                      head_dim=16, num_hidden_layers=2, vocab_size=256,
+                      num_target_layers=8, block_size=4)
+    m = build_drafter(cfg)
+    assert hasattr(m, "target_layer_ids")
+    assert m.target_layer_ids == build_target_layer_ids(8, 2)
+    assert hasattr(m, "block_size") and m.block_size == 4
+
+
+_E2E_JSON = Path("/scratch/li96/mz9869/medusa_outputs/linked_medusa_c1_eagle/"
+                 "e2e_speed_300/dyn_k8_n24.json")
+_MANIFEST = Path("/scratch/li96/mz9869/eval_manifests/manifest_300.json")
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.skipif(not (_E2E_JSON.exists() and _MANIFEST.exists()),
+                    reason="champion artifacts not accessible")
+def test_filter_prompts_matches_champion_run():
+    """harness 的 filter_prompts(80, 42, ordered) 选集必须与 175598529
+    冠军跑的 prompt id 序列逐项一致(从 per_prompt_results 重建)。"""
+    import json
+    from decode.common import filter_prompts
+    ours = [p["id"] for p in filter_prompts(str(_MANIFEST), 80, 42,
+                                            ordered=True)[:300]]
+    ref = [p["id"] for p in
+           json.load(open(_E2E_JSON))["per_prompt_results"]]
+    assert len(ours) == len(ref) == 300
+    assert ours == ref
+
+
 def test_paired_bootstrap_ci():
     import random
     rng = random.Random(0)
