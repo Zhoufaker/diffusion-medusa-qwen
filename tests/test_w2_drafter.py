@@ -202,7 +202,7 @@ def test_pilot_shard_roundtrip_spans_and_collate():
 
 
 # ------------------------------------------------- F1: short-sample filter --
-def _fake_cache(tmp_path, Ls=(1, 2, 150)):
+def _fake_cache(tmp_path, Ls=(1, 2, 150), n_layers=5, H=8):
     from safetensors.torch import save_file
     tensors, samples = {}, {}
     for i, L in enumerate(Ls):
@@ -210,7 +210,7 @@ def _fake_cache(tmp_path, Ls=(1, 2, 150)):
         T = P + L
         ids = torch.arange(T)
         tensors[f"{i}.ids"] = ids
-        tensors[f"{i}.ctx"] = torch.zeros(5, T, 8, dtype=torch.bfloat16)
+        tensors[f"{i}.ctx"] = torch.zeros(n_layers, T, H, dtype=torch.bfloat16)
         tensors[f"{i}.spans"] = torch.tensor([2, 6, 0, P, P, T])
         samples[str(i)] = {"idx": i, "T": T, "P": P, "L": L, "n_pos": L,
                            "n_match": L - (1 if L > 2 else 0),
@@ -311,3 +311,60 @@ def test_eval_only_load_fidelity_cpu(tmp_path):
     model2.load_state_dict(ck["state_dict"])
     ce_after = val_ce(model2)
     assert ce_before == ce_after             # bitwise identical on CPU
+
+
+# ------------------------------------- resume bundle equivalence (任务 2) ----
+def test_resume_bundle_two_epoch_equivalence(tmp_path):
+    """1 epoch + bundle-resume + 1 epoch == 2 continuous epochs, per-step
+    loss trajectories bitwise identical (CPU fp32 deterministic; tolerance 0).
+    Exercises: bundle round-trip (model/optimizer/scheduler/RNG), (seed,epoch)-
+    derived shuffle + anchors."""
+    import functools
+    from train.train_drafter import (TrainConfig, build_drafter, run_epoch,
+                                     save_bundle, load_bundle, epoch_generator)
+    from data.ctx_dataset import CtxShardDataset
+    d = _fake_cache(tmp_path, Ls=(20, 33, 47, 61, 28, 39, 55, 44),
+                    n_layers=2, H=64)
+    cfg = TrainConfig(hidden_size=64, intermediate_size=128,
+                      num_attention_heads=4, num_key_value_heads=2,
+                      head_dim=16, num_hidden_layers=2, vocab_size=512,
+                      num_target_layers=8, block_size=4, batch_seqs=2,
+                      lr=1e-3, epochs=2)
+
+    def fresh():
+        torch.manual_seed(7)
+        m = build_drafter(cfg).float()
+        e = torch.nn.Embedding(512, 64).requires_grad_(False)
+        h = torch.nn.Linear(64, 512, bias=False).requires_grad_(False)
+        opt = torch.optim.AdamW(m.parameters(), lr=cfg.lr)
+        sch = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: 1.0)
+        return m, e, h, opt, sch
+
+    def loader(epoch):
+        ds = CtxShardDataset(str(d))
+        collate = functools.partial(
+            collate_packed, block_size=4, alpha=1.0, max_anchors=8,
+            seed=cfg.data_seed, epoch=epoch, mask_token_id=500)
+        return torch.utils.data.DataLoader(
+            ds, batch_size=cfg.batch_seqs, shuffle=True,
+            generator=epoch_generator(cfg.data_seed, epoch),
+            collate_fn=collate, num_workers=0)
+
+    dev = torch.device("cpu")
+    # A: continuous 2 epochs
+    m, e, h, opt, sch = fresh()
+    lossesA = []
+    for ep in range(2):
+        lossesA += run_epoch(m, e, h, loader(ep), cfg, dev, opt, sch)["step_losses"]
+    # B: 1 epoch -> bundle -> fresh objects -> resume -> 1 epoch
+    m, e, h, opt, sch = fresh()
+    lossesB = run_epoch(m, e, h, loader(0), cfg, dev, opt, sch)["step_losses"]
+    save_bundle(m, opt, sch, epoch_done=0, gstep=4, best=min(lossesB), out=tmp_path)
+    m2, e2, h2, opt2, sch2 = fresh()
+    ep_done, gstep, best = load_bundle(tmp_path / "bundle_latest.pt",
+                                       m2, opt2, sch2, dev)
+    assert ep_done == 0 and gstep == 4
+    lossesB += run_epoch(m2, e2, h2, loader(ep_done + 1), cfg, dev, opt2, sch2)["step_losses"]
+    assert lossesA == lossesB                # bitwise, tolerance 0
+    # single-copy invariant: exactly one bundle file, no tmp remnants
+    assert [p.name for p in tmp_path.glob("bundle_latest.pt*")] == ["bundle_latest.pt"]

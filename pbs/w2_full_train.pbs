@@ -1,0 +1,66 @@
+#!/bin/bash
+# W2 全量训练 — 分档模板（必审档：预算包 reports/w2_full_train_budget.md
+# 过审后才可 qsub）。三档 × 2 epochs，档间 --resume-from bundle 续跑。
+#
+# 用法（每档提交前改两行环境变量,属免审范围的"仅改索引/清单"类变更）：
+#   TRANCHE=1: UNTIL=2, RESUME=""            （epoch 0-1）
+#   TRANCHE=2: UNTIL=4, RESUME=bundle_latest （epoch 2-3）
+#   TRANCHE=3: UNTIL=6, RESUME=bundle_latest （epoch 4-5）
+#
+# 中止判据（报告模板同款,人工执行,不自动 qdel）：
+#   progress.json 的 val_ce_history 连续 2 epoch 上升 → 停止提交后续档,
+#   带曲线报告用户。
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=150GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=14:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N w2_full_train
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+UNTIL=${UNTIL:-2}
+RESUME=${RESUME:-}
+OUT=/scratch/li96/mz9869/dflash_data/drafter_ckpt_full
+
+cd /home/562/mz9869/medusa-qwen
+echo "=== W2 full train tranche until-epoch=${UNTIL} resume='${RESUME}' $(date) commit $(git rev-parse --short HEAD) ==="
+RESUME_ARG=""
+[ -n "${RESUME}" ] && RESUME_ARG="--resume-from ${RESUME}"
+python train/train_drafter.py \
+    --cache-dir /scratch/li96/mz9869/dflash_data/ctx_cache_35k \
+    --out-dir ${OUT} \
+    --train-until-epoch ${UNTIL} \
+    --self-check \
+    ${RESUME_ARG}
+RC=$?
+python - <<PYEOF
+import json
+s = {"job": "${PBS_JOBID}", "kind": "w2_full_train_tranche",
+     "until_epoch": ${UNTIL}, "exit": ${RC}}
+try:
+    p = json.load(open("${OUT}/progress.json"))
+    s.update(epochs_done=p["epochs_done"], best_val_ce=p["best_val_ce"],
+             last_val_ce=p["last_val_ce"], bundle=p["bundle"],
+             val_ce_history_this_run=p["val_ce_history_this_run"])
+except Exception as e:
+    s["progress_error"] = str(e)[:200]
+json.dump(s, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"))
+print("sentinel:", s)
+PYEOF
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}

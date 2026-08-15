@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -187,13 +188,16 @@ def run_epoch(model, embed, lm_head, loader, cfg: TrainConfig, device,
     training = optimizer is not None
     model.train(training)
     tot_loss = tot_steps = 0
+    step_losses: list[float] = []
     metas_seen: list[dict] = []
     t0 = time.time()
     for step, batch in enumerate(loader):
         ctx = batch["ctx"].to(device)                      # (Bs,5,T,H)
         Bs, five, T, H = ctx.shape
-        ctx_flat = ctx.permute(0, 2, 1, 3).reshape(Bs, T, five * H)
-        noise_emb = embed(batch["noise_ids"].to(device))
+        pdtype = next(model.parameters()).dtype
+        ctx_flat = (ctx.permute(0, 2, 1, 3).reshape(Bs, T, five * H)
+                    .to(pdtype))
+        noise_emb = embed(batch["noise_ids"].to(device)).to(pdtype)
         allow = batch["allow"].to(device)                  # (Bs,N,T+N)
         amask = torch.where(
             allow.unsqueeze(1), 0.0, torch.finfo(noise_emb.dtype).min
@@ -222,12 +226,14 @@ def run_epoch(model, embed, lm_head, loader, cfg: TrainConfig, device,
                     scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
         tot_loss += float(loss.detach()); tot_steps += 1
+        step_losses.append(float(loss.detach()))
         metas_seen.extend(batch["metas"])
         if training and step % log_every == 0:
             print(f"[train] step {step} loss {loss:.4f} "
                   f"lr {optimizer.param_groups[0]['lr']:.2e} "
                   f"{(time.time()-t0):.0f}s", flush=True)
     return {"mean_loss": tot_loss / max(1, tot_steps),
+            "step_losses": step_losses,
             "offpolicy": offpolicy_stats(metas_seen)}
 
 
@@ -236,6 +242,45 @@ def save_drafter(model, cfg: TrainConfig, out: Path, tag: str, step: int):
     sd = {k: v.to(torch.bfloat16) for k, v in model.state_dict().items()}
     torch.save({"state_dict": sd, "config": dataclasses.asdict(cfg),
                 "step": step}, out / f"drafter_{tag}.pt")
+
+
+def save_bundle(model, optimizer, scheduler, epoch_done: int, gstep: int,
+                best: float, out: Path):
+    """Resume bundle (epoch boundary, 用户已裁决): full-precision drafter sd +
+    optimizer + scheduler + counters + RNG states. Single latest copy (~15G):
+    written to .tmp then atomically replaced; the previous bundle is thereby
+    deleted."""
+    state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+             "scheduler": scheduler.state_dict(),
+             "epoch_done": epoch_done, "gstep": gstep, "best": best,
+             "rng": {"torch": torch.get_rng_state(),
+                     "cuda": (torch.cuda.get_rng_state_all()
+                              if torch.cuda.is_available() else None),
+                     "python": random.getstate()}}
+    tmp = out / "bundle_latest.pt.tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, out / "bundle_latest.pt")
+
+
+def load_bundle(path: str, model, optimizer, scheduler, device):
+    ck = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ck["model"])
+    optimizer.load_state_dict(ck["optimizer"])
+    scheduler.load_state_dict(ck["scheduler"])
+    torch.set_rng_state(ck["rng"]["torch"].cpu())
+    if ck["rng"]["cuda"] is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all([s.cpu() for s in ck["rng"]["cuda"]])
+    random.setstate(ck["rng"]["python"])
+    return ck["epoch_done"], ck["gstep"], ck["best"]
+
+
+def epoch_generator(data_seed: int, epoch: int) -> torch.Generator:
+    """Shuffle order derives from (data_seed, epoch) only — resume-safe:
+    epoch k's batch order is identical whether reached continuously or via
+    --resume-from (design F3 extension for bundles)."""
+    g = torch.Generator()
+    g.manual_seed(data_seed * 100003 + epoch)
+    return g
 
 
 def self_check(model, embed, lm_head, val_loader, cfg: TrainConfig, device,
@@ -314,6 +359,12 @@ def main() -> int:
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--init-from", default=None,
                     help="F5: load a drafter checkpoint before training/eval")
+    ap.add_argument("--resume-from", default=None,
+                    help="resume bundle path: continue from epoch_done+1 with "
+                         "optimizer/scheduler/RNG restored")
+    ap.add_argument("--train-until-epoch", type=int, default=None,
+                    help="tranche mode: stop after epoch index < this bound "
+                         "(scheduler still built for cfg.epochs total)")
     ap.add_argument("--eval-only", action="store_true",
                     help="F5: run the fixed val epoch only, write JSON, exit")
     ap.add_argument("--self-check", action="store_true",
@@ -334,10 +385,20 @@ def main() -> int:
     json.dump(val_idx, open(out / "val_indices.json", "w"))
     if args.limit:
         train_idx = train_idx[: args.limit]
+    cache_man = json.load(open(Path(args.cache_dir) / args.manifest_name))
+    idx_hash = lambda xs: hashlib.sha256(  # noqa: E731
+        json.dumps(xs).encode()).hexdigest()
     json.dump({"n_filtered_short_L_lt_2": len(ds.filtered_short),
                "filtered_short_indices": ds.filtered_short,
                "n_train": len(train_idx), "n_val": len(val_idx),
                "val_file": "val_indices.json", "limit": args.limit,
+               "data_snapshot": {              # 预算包快照字段（任务 3）
+                   "cache_dir": args.cache_dir,
+                   "cache_manifest_created": cache_man.get("created"),
+                   "cache_manifest_code_commit": cache_man.get("code_commit"),
+                   "cache_hardware": cache_man.get("hardware"),
+                   "train_indices_sha256": idx_hash(train_idx),
+                   "val_indices_sha256": idx_hash(val_idx)},
                "config": dataclasses.asdict(cfg)},
               open(out / "train_manifest.json", "w"), indent=1)
 
@@ -347,8 +408,10 @@ def main() -> int:
             items, cfg.block_size, cfg.alpha, cfg.max_anchors,
             cfg.data_seed, epoch)
     def train_loader_for(epoch: int):
+        # shuffle order derives from (data_seed, epoch) — resume-safe
         return torch.utils.data.DataLoader(
             mk(train_idx), batch_size=cfg.batch_seqs, shuffle=True,
+            generator=epoch_generator(cfg.data_seed, epoch),
             collate_fn=coll(epoch), num_workers=0)
     # F3: val pins epoch=0 -> fixed anchors across all evaluations
     val_loader = torch.utils.data.DataLoader(
@@ -391,21 +454,45 @@ def main() -> int:
 
     best = float("inf")
     gstep = 0
+    start_epoch = 0
+    if args.resume_from:
+        ep_done, gstep, best = load_bundle(
+            args.resume_from, model, optimizer, scheduler, device)
+        start_epoch = ep_done + 1
+        print(f"[resume] bundle {args.resume_from}: epochs 0-{ep_done} done, "
+              f"gstep {gstep}, best {best:.4f}; starting epoch {start_epoch}",
+              flush=True)
     t_train0 = time.time()
-    for ep in range(cfg.epochs):
+    val_hist: list[float] = []
+    end_epoch = (min(cfg.epochs, args.train_until_epoch)
+                 if args.train_until_epoch is not None else cfg.epochs)
+    for ep in range(start_epoch, end_epoch):
         tr = run_epoch(model, embed, lm_head, train_loader_for(ep), cfg,
                        device, optimizer, scheduler)
         with torch.no_grad():
             va = run_epoch(model, embed, lm_head, val_loader, cfg, device)
         gstep += steps_per_epoch
+        val_hist.append(va["mean_loss"])
         print(f"[epoch {ep}] train {tr['mean_loss']:.4f} val {va['mean_loss']:.4f} "
               f"offpolicy {va['offpolicy']['offpolicy_share_exact']:.4f}", flush=True)
         save_drafter(model, cfg, out, f"step{gstep}", gstep)
         if va["mean_loss"] < best:
             best = va["mean_loss"]
             save_drafter(model, cfg, out, "best", gstep)
+        save_bundle(model, optimizer, scheduler, ep, gstep, best, out)
         json.dump({"epoch": ep, "train": tr, "val": va},
                   open(out / f"epoch_{ep}_stats.json", "w"), indent=1)
+        json.dump({"epochs_done": ep + 1, "best_val_ce": best,
+                   "last_val_ce": va["mean_loss"],
+                   "bundle": str(out / "bundle_latest.pt"),
+                   "val_ce_history_this_run": val_hist},
+                  open(out / "progress.json", "w"), indent=1)
+
+    if end_epoch < cfg.epochs:
+        print(f"[tranche] stopped after epoch {end_epoch - 1} "
+              f"(target {cfg.epochs}); bundle ready for --resume-from",
+              flush=True)
+        return 0
 
     # 门4 load fidelity: reload best checkpoint, rerun fixed val, |ΔCE|<1e-3
     ck = torch.load(out / "drafter_best.pt", map_location="cpu",
