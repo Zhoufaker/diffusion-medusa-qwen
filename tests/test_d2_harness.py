@@ -7,9 +7,12 @@ from types import SimpleNamespace
 import torch
 
 _ROOT = Path(__file__).resolve().parent.parent
-for p in (str(_ROOT), str(_ROOT / "external" / "dflash"), str(_ROOT / "scripts")):
+for p in (str(_ROOT), str(_ROOT / "external" / "dflash")):
     if p not in sys.path:
         sys.path.insert(0, p)
+# scripts/ 只允许 append(scripts/train.py 与 train/ 包同名,见 2026-08-16 事故)
+if str(_ROOT / "scripts") not in sys.path:
+    sys.path.append(str(_ROOT / "scripts"))
 
 from d2_eval_harness import latin_order, paired_bootstrap_ci  # noqa: E402
 from decode.dflash_vlm import dflash_vlm_generate, run_twice_check  # noqa: E402
@@ -135,6 +138,40 @@ def test_latin_square_balance():
             slot_arm[s][a] += 1
     for s in range(3):
         assert all(slot_arm[s][a] == 100 for a in range(3))
+
+
+def test_no_train_shadowing_subprocess():
+    """子进程隔离复现 harness 真实 import 顺序,断言 train 解析到包。
+
+    为什么必须子进程:pytest 进程内其他测试早已 import 过 train 包,
+    sys.modules 缓存会掩护遮蔽——2026-08-16 冒烟事故(job 176390465,
+    scripts/train.py 遮蔽 train/)正是这样漏过了进程内单测。
+    序列忠实复现 `python scripts/d2_eval_harness.py` 的现实:解释器启动
+    自动把 scripts/ 置于 sys.path[0](对抗性前提),随后 harness 模块顶
+    插 _ROOT/external,main 内先 eager import train.train_drafter,
+    再 append scripts/ 并导入 eval_acceptance_tree(两线共存)。
+    """
+    import subprocess
+    root = str(_ROOT)
+    code = f"""
+import sys
+sys.path.insert(0, {str(_ROOT / 'scripts')!r})      # 解释器启动的 script-dir 语义
+sys.path.insert(0, {str(_ROOT / 'external' / 'dflash')!r})
+sys.path.insert(0, {root!r})                         # harness 模块顶两条 insert
+import train.train_drafter as td                     # main 内 eager import
+import pathlib
+p = pathlib.Path(td.__file__)
+assert p.parent.name == 'train' and (p.parent / '__init__.py').exists(), td.__file__
+sys.path.append({str(_ROOT / 'scripts')!r})          # append 条款
+import eval_acceptance_tree as e                     # 臂② 入口共存
+assert hasattr(e, 'run_one_prompt_tree_folded')
+import train
+assert hasattr(train, '__path__'), 'train must be a package, not scripts/train.py'
+print('NO_SHADOWING_OK')
+"""
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, timeout=300)
+    assert r.returncode == 0 and "NO_SHADOWING_OK" in r.stdout, r.stderr[-2000:]
 
 
 def test_drafter_exposes_target_layer_ids():

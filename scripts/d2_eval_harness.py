@@ -88,11 +88,16 @@ def main() -> int:
     ap.add_argument("--device", default="cuda:0")
     args = ap.parse_args()
 
+    # 故障修复(2026-08-16,job 176390465 教训):
+    # 1) 先 eager import train 包(scripts/train.py 与 train/ 同名,任何
+    #    后续路径操纵都不得影响已缓存的包解析);
+    # 2) scripts/ 只允许 append(CLAUDE.md 条款)——包名优先于同名模块。
+    import train.train_drafter  # noqa: F401  (eager, anti-shadowing)
     from decode.common import (load_base, load_head, make_image_inputs,
                                vanilla_greedy, filter_prompts, cfg_attr)
     from decode.dflash_vlm import (load_drafter_for_inference,
                                    dflash_vlm_generate, run_twice_check)
-    sys.path.insert(0, str(_ROOT / "scripts"))
+    sys.path.append(str(_ROOT / "scripts"))
     from eval_acceptance_tree import run_one_prompt_tree_folded
 
     out = Path(args.out_dir); (out / "per_prompt").mkdir(parents=True, exist_ok=True)

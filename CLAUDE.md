@@ -64,6 +64,11 @@
 - 任何对导师代码包内文件的操作一律先复制到本项目目录，原包只读
 - 目录名不是谱系证据——onpolicy_data 与 qwen25vl_long 两起误标事故的教训；
   任何资产的处置决策前必须实物盘点
+- 模块命名与 sys.path 纪律（2026-08-16 冒烟事故教训，scripts/train.py
+  遮蔽 train/ 包）：scripts/ 下新文件 basename 不得与仓库顶层包/目录同名
+  （现存碰撞仅 scripts/train.py，旧线入口不改名）；任何代码将 scripts/
+  加入 sys.path 一律 **append**、严禁 insert(0)；跨包惰性 import 前
+  先行 eager import 目标包
 
 ## PBS 作业分级审查规则
 - 免审（agent 按自查清单核对后可直接 qsub）：
