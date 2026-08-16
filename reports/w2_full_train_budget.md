@@ -58,6 +58,14 @@
 | cache_manifest_created / code_commit / hardware | 运行时从 ctx_manifest.json 读取（2026-08-15 / 4c71fada / A100-dgxa100） |
 | train_indices_sha256 / val_indices_sha256 | 索引清单 JSON 序列化后 sha256，随 val_indices.json 落盘 |
 
+## 5b. 实耗补记（2026-08-16，用户追认）
+
+- **T1 实耗 936.8 SU / 13h00m**（预算 ~800/11h，慢 ~20%——smoke 短序列
+  子集外推偏乐观）
+- 单次全量上修 **~2,820 SU**；三次重训包络 **~8.5 KSU**（余额 137.73K 的
+  **6.2%**）
+- **T2 walltime 16h 已追认**（T1 仅剩 1h 余量的防护性调整；T3 同形）
+
 ## 6. 执行清单（批准后）
 
 1. qsub T1（`UNTIL=2` 无 resume）—— 模板 pbs/w2_full_train.pbs 已过形状审查

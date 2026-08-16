@@ -1,0 +1,55 @@
+#!/bin/bash
+# D2 推理冒烟(方案 reports/d2_smoke_plan.md 已批):20 prompts × 三臂,
+# pinned epoch-2 best 档,A100,预估 <30 SU。异常分支:任何一臂崩溃/
+# G2 失败/输出乱码 → 停,带 D3 埋点出诊断,不重试不改代码。
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=150GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N d2_smoke
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+OUT=/scratch/li96/mz9869/dflash_data/d2/smoke
+mkdir -p ${OUT}
+cd /home/562/mz9869/medusa-qwen
+echo "=== D2 smoke $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/d2_eval_harness.py \
+    --images-dir /g/data/li96/mz9869/data/coco_subset \
+    --drafter-ckpt /scratch/li96/mz9869/dflash_data/drafter_ckpt_full/drafter_best_ep2_pinned.pt \
+    --g0a-result /scratch/li96/mz9869/dflash_data/d2/g0a/g0a_result.json \
+    --out-dir ${OUT} \
+    --n-prompts 20
+RC=$?
+python - <<PYEOF
+import json
+s = {"job": "${PBS_JOBID}", "kind": "d2_smoke", "exit": ${RC}}
+try:
+    d = json.load(open("${OUT}/d2_summary.json"))
+    s.update(n_scored=d["n_scored"], G1_point=d["G1"]["point"],
+             G2_pass=d["G2"]["pass"],
+             cross_exact=d["cross_arm"]["exact_rate"],
+             tau_accept_only=d["tau_accept_only"],
+             tau_with_bonus=d["tau_with_bonus"])
+except Exception as e:
+    s["summary_error"] = str(e)[:200]
+json.dump(s, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"))
+print("sentinel:", s)
+PYEOF
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}
