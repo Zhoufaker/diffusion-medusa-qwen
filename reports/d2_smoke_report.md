@@ -1,51 +1,73 @@
-# D2 冒烟报告(异常分支——诊断版)
+# D2 冒烟报告(重跑成功版)
 
-2026-08-16。Job 176390465(dgxa100),**exit 1,walltime 2m36s,实耗 3.12 SU**。
-按方案异常分支执行:停、出诊断、不重试、不改代码。T2 未受影响。
+2026-08-17。Job 176399845(dgxa100),exit 0,walltime 8m39s,**10.38 SU**。
+首跑 176390465 因 scripts/train.py 遮蔽事故失败(3.12 SU,诊断与修复见
+git aef478a/72d3ab5,本文件历史版本);修复后原方案原预算重跑。
+checkpoint:**drafter_best_ep2_pinned.pt(2/6 epochs,欠训练档)**。
 
-## 故障定位(唯一根因,证据完整)
+## harness 自动判定全文
 
-**sys.path 模块遮蔽**:`scripts/train.py`(旧线训练入口,模块)遮蔽了
-`train/`(新线训练包)。
+- **G0(引用)**:G0a pass=true(100/100 byte-exact,job 176356106);
+  **G0b 新基准:臂② A100 per-token 加速比 = 1.758×**(V100 时代 1.732×,
+  量级延续);σ_batch=0.0537 登记
+- **G1(仅登记,不解读——n=15 无统计力,且为欠训练 2/6 epoch 档,
+  此结果不构成任何判定)**:point = −0.128,CI95 [−0.185, −0.068]
+- **G2 通过**:3 条双跑,256 token 全长逐 token 一致(first_div=null ×3)
 
-```
-harness main() → sys.path.insert(0, _ROOT/"scripts")   # 为导入 eval_acceptance_tree
-→ load_drafter_for_inference()                          # dflash_vlm.py:40 惰性 import
-→ from train.train_drafter import ...                   # 解析到 scripts/train.py!
-→ scripts/train.py:37: from train.trainer import Trainer
-→ ModuleNotFoundError: 'train' is not a package
-```
+## 三臂速度(n=15,warmup 5 弃计)
 
-- 失败点在**drafter 加载之前**:base(56s)与旧线 head(88s)已正常载入,
-  三臂零执行、零计时数据、D3 目录空(0 文件)
-- 输出目录仅哨兵(exit=1 + summary 缺失注记),per_prompt 0 条
+| 臂 | 单 prompt 均耗 | tok/s | per-token 加速比 |
+|---|---|---|---|
+| ① AR greedy | 7.11 s | 35.5 | 1.000 |
+| ② dyn_k8_n24 | 4.10 s | 61.4 | **1.758** |
+| ③ dflash b16(2/6 epochs) | 4.41 s | 57.1 | **1.61** |
 
-## 为何单测未拦截(诚实登记)
+欠训练档已达冠军的 92%(登记;判定留给满档 300 条正式跑)。
 
-1. mock 全流程测试从不调用 `load_drafter_for_inference`(其内部 import 是
-   函数级惰性的——恰是被遮蔽的那行)
-2. W2 测试在同 pytest 进程中**先**导入了 `train` 包 → `sys.modules` 缓存
-   掩护了后续遮蔽
-3. 教训:路径操纵(insert(0))+ 同名模块/包共存 + 惰性 import 三者叠加,
-   构成单测盲区
+## τ 两口径首次实测(欠训练档,只登记,不与论文对照)
 
-## 修复方案(待授权,一行级改动 + 回归测试)
+- τ_accept_only = **1.193**(每轮纯接受 draft 数)
+- τ_with_bonus = **2.193**(每轮推进量)
 
-1. `scripts/d2_eval_harness.py`:
-   a. `sys.path.insert(0, scripts/)` 改为 **append**(train 包优先解析);
-   b. 在插入 scripts/ 之前**先行 eager import** `train.train_drafter`
-      (双保险,消除对 path 顺序的依赖)
-2. 回归测试:在 `sys.path` 含 scripts/ 的前提下断言
-   `importlib.import_module("train.train_drafter")` 解析到包路径
-   (`train/__init__.py` 所在目录),并实调 `load_drafter_for_inference`
-   的 import 段(CPU、仅 import 不加载权重)
-3. 修复经 CPU 测试全绿后,冒烟重跑(同方案同预算,预计仍 <30 SU;
-   本次 3.12 SU 计入损耗)
+## 臂③ vs 臂① 匹配率(登记项)
 
-## 资源与状态
+- 逐条完全一致:**10/15**;原始位置级匹配 84.1%(3,178/3,779,分叉后
+  尾部计入);前缀法分叉率 ≈ **0.16%/位置**(5 次首分叉 / ~3.1K 前缀位置)
+- **对照漂移预期的重要更正**:协议预期 ~96%/位置 引自四臂矩阵的
+  "整序列 TF vs V100 增量"(硬件+形态叠加)。冒烟实测两臂同为 A100,
+  且臂③ 的 verify 是**带 cache 的 16-token 块增量**——数值路径贴近
+  1-token 增量而非整序列 TF,分叉率落在纯硬件效应量级(0.16%),
+  **好于预期一个数量级**。0.998^250 ≈ 60% 全序列一致,与 10/15 吻合。
+  结论:block verify 与 AR greedy 的实际漂移远小于保守预期(仅登记)
+- 分叉样本 5 条 id 已入 summary;3 条人工过目(含 2 条分叉样本):
+  输出全部通顺连贯,无重复段/乱码/位置错乱——**rope_deltas 整块 verify
+  路径合理性确认**(过目文本节录存 per_prompt/*.json)
 
-- 本次损耗:3.12 SU(总账:D2 线累计 G0a 10.13 + 冒烟失败 3.12)
-- 显存:崩溃点 21.07GB(base+head 已载,drafter 未及加载)
-- **T2(176390196)排队中,未受任何影响**;git 干净;
-  lquota:scratch 4.77/10 TiB,inode ~647K 正常
-- 等待授权:按上述方案修复 → 重跑冒烟
+## 显存与 300 条正式跑外推
+
+- GPU 峰值(PBS 口径):~21-24GB(target fp16 + 旧线 head 3.5B + drafter,
+  80G 卡余量充足)
+- 单 prompt 三臂合计 ≈ 15.6s → 300 条 ≈ 78 min + 模型加载 ~3 min +
+  G2 双跑 ≈ **walltime 申请 2.5h,预估 SU ~110-130**
+
+## D2 线损耗台账
+
+| 项 | SU |
+|---|---|
+| G0a(V100 字节门,过) | 10.13 |
+| 冒烟首跑(遮蔽事故) | 3.12 |
+| 冒烟重跑(本报告) | 10.38 |
+| **累计** | **23.63** |
+
+## 判定与后续
+
+冒烟检查项全绿(G2 ✓、人工过目 ✓、匹配率登记 ✓、外推数据齐)。
+**申请 300 条正式 D2**(walltime 2.5h,~120 SU,满档 best ckpt——
+T3 结束后)+ off-policy 附属实验(~10 SU)同批提交,等你授权。
+
+## 训练线同步(T2 档间流程)
+
+- T2 exit 0:val CE **3.385 → 3.294** 连降(曲线 3.962→3.584→3.385→3.294),
+  中止判据未触发;956.5 SU / 13h17m(16h 申请余量足)
+- **T3 已提交:176509581**(UNTIL=6 + resume,16h);结束后出全量训练报告
+  (含门 4 保真度与完整曲线)
