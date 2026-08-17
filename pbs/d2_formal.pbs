@@ -1,0 +1,56 @@
+#!/bin/bash
+# D2 正式跑(条件预授权 2026-08-17):300 prompts × 三臂,满档终 pinned ckpt。
+# 提交前置(缺一不可):T3 exit 0 + 门4 过 + 中止判据全程未触发 +
+# 全量训练报告落盘 + drafter_best_final_pinned.pt 已固定(sha256 登记)。
+# harness 与冒烟同 commit(任何 harness/适配器改动需重新过审)。
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=150GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=02:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N d2_formal
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+OUT=/scratch/li96/mz9869/dflash_data/d2/formal
+mkdir -p ${OUT}
+cd /home/562/mz9869/medusa-qwen
+echo "=== D2 FORMAL $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/d2_eval_harness.py \
+    --images-dir /g/data/li96/mz9869/data/coco_subset \
+    --drafter-ckpt /scratch/li96/mz9869/dflash_data/drafter_ckpt_full/drafter_best_final_pinned.pt \
+    --g0a-result /scratch/li96/mz9869/dflash_data/d2/g0a/g0a_result.json \
+    --out-dir ${OUT} \
+    --n-prompts 300
+RC=$?
+python - <<PYEOF
+import json
+s = {"job": "${PBS_JOBID}", "kind": "d2_formal", "exit": ${RC}}
+try:
+    d = json.load(open("${OUT}/d2_summary.json"))
+    s.update(n_scored=d["n_scored"], G1=d["G1"], G2_pass=d["G2"]["pass"],
+             G0b_tree=d["G0"]["G0b_tree_speedup_mean_new_baseline"],
+             cross_exact=d["cross_arm"]["exact_rate"],
+             tau_accept_only=d["tau_accept_only"],
+             tau_with_bonus=d["tau_with_bonus"])
+except Exception as e:
+    s["summary_error"] = str(e)[:200]
+json.dump(s, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"))
+print("sentinel:", s)
+PYEOF
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}
