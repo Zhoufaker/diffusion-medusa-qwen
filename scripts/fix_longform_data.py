@@ -126,17 +126,36 @@ def iter_docci(staging: Path):
 
 def iter_detailcaps():
     """DetailCaps HF 路:registry _hf_candidates 顺序语义逐行复刻
-    (candidates 首个可用 = test split;ds.shuffle(seed=SEED) 后顺序迭代)。"""
+    (candidates 首个可用 = test split;ds.shuffle(seed=SEED) 后顺序迭代)。
+
+    [EXPORT-MOD 同级登记适配,2026-08-19 用户批准(决策点①)]:
+    该源 schema 与 registry 字段链错位,进 registry 前做登记性映射——
+      reference := GT_Caption_{GPT4O,GPT4V,Gemini15Pro} 三列取最长
+                  (镜像 registry 对 caption 列表"取最长"的既有约定);
+      id        := image 路径基名(COCO id 兼容 → 图像键去重可对撞评估集);
+      image     := binary 原始字节(registry _to_rgb 可验证,打包零重编码)。
+    """
     from datasets import load_dataset
+    GT_COLS = ("GT_Caption_GPT4O", "GT_Caption_GPT4V", "GT_Caption_Gemini15Pro")
     ds = load_dataset("foundation-multimodal-models/DetailCaps-4870", split="test")
     ds = ds.shuffle(seed=SEED)                 # == registry _hf_candidates
     for raw in ds:
-        yield raw, None
+        gts = [(raw.get(k) or "").strip() for k in GT_COLS]
+        rec = {
+            "id": Path(raw["image"]).stem,
+            "reference": max(gts, key=len),
+            "image": raw["binary"],
+            "binary": raw["binary"],
+            "origin_subset": raw.get("source"),
+        }
+        yield rec, None
 
 
 def raw_image_bytes(rec, base_dir):
     """[EXPORT-MOD] 打包用原始字节(不重编码)。返回 (bytes, ext) 或 None。"""
     v = REG._field(rec, REG.IMAGE_FIELDS)
+    if isinstance(v, (bytes, bytearray)):      # [EXPORT-MOD] 原始字节直取
+        return bytes(v), ".jpg"
     if isinstance(v, dict) and v.get("bytes"):
         return v["bytes"], (Path(v.get("path") or "img.jpg").suffix or ".jpg")
     if isinstance(v, str) and not v.startswith("http"):

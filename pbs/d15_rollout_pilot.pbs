@@ -1,0 +1,70 @@
+#!/bin/bash
+# D1.5 rollout 长度 pilot(必审档草案——发审查,未获批不 qsub)。
+# 关键审查点:gen_cache_rollout.py 【零改动】(Arm1 100% 复现验证过的
+# 脚本一字不动)——输入经 prep_longform_pilot.py 适配为其原生
+# --prompts/--images-dir 形态;--max-new 512 为既有参数(给足测量上限)。
+# 产出:50 条 rollout 长度分布 + 截断率@384/@512 + 3 条样例全文。
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=100GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=00:30:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N d15_rollout_pilot
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+P=/scratch/li96/mz9869/dflash_data/longform_fixed_v1/pilot
+OUT=${P}/rollout512
+mkdir -p ${OUT}
+cd /home/562/mz9869/medusa-qwen
+echo "=== D1.5 rollout pilot $(date) commit $(git rev-parse --short HEAD) ==="
+python scripts/gen_cache_rollout.py \
+    --prompts ${P}/pilot_prompts.json \
+    --images-dir ${P}/images \
+    --out-dir ${OUT} \
+    --max-new 512
+RC=$?
+python - <<PYEOF
+import json, glob, statistics as st
+import torch
+files = sorted(glob.glob("${OUT}/*.pt"))
+Ls = []
+for f in files:
+    Ls.append(int(torch.load(f, map_location="cpu",
+                             weights_only=True)["tokens"].shape[0]))
+Ls.sort(); n = len(Ls)
+s = {"job": "${PBS_JOBID}", "kind": "d15_rollout_pilot", "exit": ${RC},
+     "n": n}
+if n:
+    s.update(mean=round(st.mean(Ls), 1), med=Ls[n // 2], p10=Ls[n // 10],
+             p90=Ls[9 * n // 10], max=Ls[-1],
+             trunc_at_384=sum(1 for x in Ls if x >= 384) / n,
+             trunc_at_512=sum(1 for x in Ls if x >= 512) / n)
+json.dump(s, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"), indent=1)
+print("sentinel:", s)
+# 3 条样例全文(idx 0/1/2)供人工过目
+from transformers import AutoTokenizer
+tk = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+with open("${OUT}/samples_for_review.txt", "w") as fo:
+    for f in files[:3]:
+        toks = torch.load(f, map_location="cpu", weights_only=True)["tokens"]
+        fo.write(f"===== {f} ({toks.shape[0]} tok) =====\n")
+        fo.write(tk.decode(toks.tolist()) + "\n\n")
+print("samples -> ${OUT}/samples_for_review.txt")
+PYEOF
+echo "=== DONE $(date) rc=${RC} ==="
+exit ${RC}
