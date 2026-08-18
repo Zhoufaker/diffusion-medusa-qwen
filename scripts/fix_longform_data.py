@@ -230,6 +230,10 @@ def main() -> int:
     ap.add_argument("--staging", default="/scratch/li96/mz9869/dflash_data/longform_fixed_v1/staging/docci")
     ap.add_argument("--out", default="/scratch/li96/mz9869/dflash_data/longform_fixed_v1")
     ap.add_argument("--sources", default="docci,detailcaps")
+    ap.add_argument("--append", action="store_true",
+                    help="断点续跑:从既有 shards/triplets 重建 writer 计数与"
+                         "cross_hashes,triplets 以追加模式打开(登录节点 30min "
+                         "CPU 上限教训,2026-08-18)")
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -239,8 +243,35 @@ def main() -> int:
     print(f"[eval-keys] img={len(img_keys)} q={len(q_keys)} content={len(content_hashes)}", flush=True)
 
     writer = WdsWriter(out / "images")
-    state = {"cross_hashes": {}, "triplets": open(out / "triplets.jsonl", "w")}
-    per_source = {}
+    prior_sources = {}
+    if args.append:
+        # 重建:既有 shard 图像 payload 逐一哈希 → cross_hashes;
+        # 计数/片号从 triplets 与 shard 清单续接
+        cross = {}
+        for name in sorted((out / "images").glob("shard_*.tar")):
+            with tarfile.open(name) as tf:
+                for m in tf.getmembers():
+                    if m.name.endswith(".json"):
+                        continue
+                    cross[hashlib.sha256(tf.extractfile(m).read()).hexdigest()] = "prior"
+        n_prior = 0
+        for line in open(out / "triplets.jsonl"):
+            r = json.loads(line)
+            prior_sources[r["source"]] = prior_sources.get(r["source"], 0) + 1
+            n_prior += 1
+        writer.n = n_prior
+        writer.shard_id = n_prior // SHARD_SIZE - (1 if n_prior % SHARD_SIZE == 0 else 0)
+        last = sorted((out / "images").glob("shard_*.tar"))[-1]
+        writer.names = [p.name for p in sorted((out / "images").glob("shard_*.tar"))]
+        # 尾片未满则以追加重开:tarfile 不支持追加压缩,此处片为纯 tar,可 'a'
+        writer.shard = tarfile.open(last, "a")
+        state = {"cross_hashes": cross,
+                 "triplets": open(out / "triplets.jsonl", "a")}
+        print(f"[append] resumed at n={n_prior}, shards={len(writer.names)}, "
+              f"hashes={len(cross)}, prior={prior_sources}", flush=True)
+    else:
+        state = {"cross_hashes": {}, "triplets": open(out / "triplets.jsonl", "w")}
+    per_source = {s: {"prior_fixed": c} for s, c in prior_sources.items()}
     t0 = time.time()
     for source in args.sources.split(","):
         it = iter_docci(Path(args.staging)) if source == "docci" else iter_detailcaps()

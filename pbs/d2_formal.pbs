@@ -26,7 +26,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
 
-OUT=/scratch/li96/mz9869/dflash_data/d2/formal
+OUT=${OUT:-/scratch/li96/mz9869/dflash_data/d2/formal}   # 重复计时单经 qsub -v OUT= 覆盖
 mkdir -p ${OUT}
 cd /home/562/mz9869/medusa-qwen
 echo "=== D2 FORMAL $(date) commit $(git rev-parse --short HEAD) ==="
