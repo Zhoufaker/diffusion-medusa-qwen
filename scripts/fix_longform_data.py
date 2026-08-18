@@ -110,18 +110,23 @@ def prep_docci(staging: Path):
     print(f"[prep] docci_local.jsonl rows={n}", flush=True)
 
 
-def iter_docci(staging: Path):
-    """DOCCI 本地 jsonl 路:官方发布包 → registry jsonl 协议。
+def iter_local_jsonl(ann: Path):
+    """registry --data-path JSONL 契约的通用本地迭代器。
     顺序语义 = load_jsonl_samples 逐行复刻(records 列表 + shuffle(SEED))。
-    """
-    prep_docci(staging)
-    ann = staging / "docci_local.jsonl"
+    v2 起 docci(train-only)/sp/ln 三源共用;reference 字段
+    (description/paragraph/caption)均在 registry REFERENCE_FIELDS 链内,
+    question 缺省落 LONGFORM_PROMPT 属协议自动行为(登记于报告)。"""
     records = [json.loads(l) for l in open(ann) if l.strip()]
     rng = random.Random(SEED)
     rng.shuffle(records)                       # == registry load_jsonl_samples
     base = str(ann.parent)
     for rec in records:
         yield rec, base
+
+
+def iter_docci(staging: Path):
+    prep_docci(staging)
+    return iter_local_jsonl(staging / "docci_local.jsonl")
 
 
 def iter_detailcaps():
@@ -295,8 +300,15 @@ def main() -> int:
         state = {"cross_hashes": {}, "triplets": open(out / "triplets.jsonl", "w")}
     per_source = {s: {"prior_fixed": c} for s, c in prior_sources.items()}
     t0 = time.time()
+    staging_root = Path(args.staging).parent    # …/staging/docci -> …/staging
+    src_iters = {
+        "docci": lambda: iter_docci(Path(args.staging)),
+        "detailcaps": iter_detailcaps,
+        "sp": lambda: iter_local_jsonl(staging_root / "sp" / "sp_local.jsonl"),
+        "ln": lambda: iter_local_jsonl(staging_root / "ln" / "ln_local.jsonl"),
+    }
     for source in args.sources.split(","):
-        it = iter_docci(Path(args.staging)) if source == "docci" else iter_detailcaps()
+        it = src_iters[source]()
         stats = fix_source(source, it, writer, state, tokenizer,
                            img_keys, q_keys, content_hashes)
         per_source[source] = {**per_source.get(source, {}), **stats}
