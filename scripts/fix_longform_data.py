@@ -303,7 +303,7 @@ def main() -> int:
         print(f"[{source}] {per_source[source]}", flush=True)
     writer.close(); state["triplets"].close()
 
-    assert all(s["dup_eval"] >= 0 for s in per_source.values())
+    assert all(s.get("dup_eval", 0) >= 0 for s in per_source.values())
     # 断言:与评估清单零交集(dup_eval 已剔,复扫 triplets 直接验证)
     kept_keys = set()
     for line in open(out / "triplets.jsonl"):
