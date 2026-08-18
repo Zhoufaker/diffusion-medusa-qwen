@@ -28,3 +28,9 @@ Arm4vs3，AR 側 0.16%/位置）。预期 drafter 对 feature 输入扰动鲁棒
 - 训练消耗 ctx_cache_35k 时按 manifest spans 限定 anchor 采样范围于 rollout 段
 - 参考资料先读：dspark-aeon-27b 社区 recipe、DFlare arXiv:2606.02091
   （多 anchor 稀疏 mask 实现参照）
+
+## 4. D3 追加(2026-08-18,训练收账时登记)
+
+- epoch3 vs epoch4 档接受率校准对比(over-training 损害校准复验):
+  两档 ckpt 已留存(step34500/step43125),D2 formal 后同 harness 各跑一遍,
+  零训练成本。
