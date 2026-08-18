@@ -155,6 +155,12 @@ def fix_source(source, record_iter, writer, state, tokenizer,
     for rec, base in record_iter:
         n_in += 1
         blob = raw_image_bytes(rec, base)
+        # --append 快路径:内容哈希命中(已打包)即跳过,不做昂贵的
+        # PIL 解码(登录节点 CPU 上限防护;对结果无影响——同哈希在原跑
+        # 中也会以 dup_cross 剔除)
+        if blob is not None and hashlib.sha256(blob[0]).hexdigest() in state["cross_hashes"]:
+            n_dup_cross += 1
+            continue
         # registry 语义转换(question 模板/reference 字段链,零重写);
         # 图像加载委托 registry(损坏图即弃,与协议一致)
         try:
@@ -171,9 +177,6 @@ def fix_source(source, record_iter, writer, state, tokenizer,
         if (img_key in img_keys or img_key.split(".")[0] in img_keys
                 or h in content_hashes):
             n_dup_eval += 1
-            continue
-        if h in state["cross_hashes"]:         # 源间互重(DOCCI 先注册故优先)
-            n_dup_cross += 1
             continue
         state["cross_hashes"][h] = source
         ref = sample["reference"]
@@ -275,8 +278,9 @@ def main() -> int:
     t0 = time.time()
     for source in args.sources.split(","):
         it = iter_docci(Path(args.staging)) if source == "docci" else iter_detailcaps()
-        per_source[source] = fix_source(source, it, writer, state, tokenizer,
-                                        img_keys, q_keys, content_hashes)
+        stats = fix_source(source, it, writer, state, tokenizer,
+                           img_keys, q_keys, content_hashes)
+        per_source[source] = {**per_source.get(source, {}), **stats}
         print(f"[{source}] {per_source[source]}", flush=True)
     writer.close(); state["triplets"].close()
 
