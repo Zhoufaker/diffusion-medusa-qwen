@@ -41,7 +41,8 @@ cd /home/562/mz9869/medusa-qwen
 python scripts/prep_v2_sources.py
 RC1=$?
 
-echo "--- step3 四源固定(干净重建) ---"
+echo "--- step3 四源固定(干净重建:清除既有产物防混装) ---"
+rm -f $V2/triplets.jsonl $V2/manifest.json $V2/images/shard_*.tar
 python scripts/fix_longform_data.py \
     --staging $S/docci \
     --out $V2 \

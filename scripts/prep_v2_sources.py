@@ -35,27 +35,30 @@ def prep_sp():
     train_ids = set(json.load(open(S / "sp" / "train_split.json")))
     rows = [p for p in paras if p["image_id"] in train_ids]
     print(f"[sp] train rows {len(rows)} (expect 14575)")
-    want = {}                      # basename -> (subdir, row)
+    # 2026-08-20 修正:按【基名】匹配——images.zip 内成员无目录前缀
+    # (裸 "107900.jpg"),images2.zip 带 "VG_100K_2/" 前缀;url 推断子目录
+    # 不可靠,首跑因此漏配 8,077 张(6502/14575 事故,日志在案)
+    want = {}                      # "{image_id}.jpg" -> row(多段落图取首段)
     for p in rows:
-        sub = "VG_100K_2" if "VG_100K_2" in p["url"] else "VG_100K"
-        want[f"{sub}/{p['image_id']}.jpg"] = p
+        want.setdefault(f"{p['image_id']}.jpg", p)
     (S / "sp" / "images").mkdir(exist_ok=True)
     got = set()
     for zname in ("images.zip", "images2.zip"):
         with zipfile.ZipFile(S / "vg" / zname) as z:
-            names = set(z.namelist())
-            for member in sorted(set(want) & names):
-                out = S / "sp" / "images" / member.replace("/", "_")
-                if not out.exists():
-                    out.write_bytes(z.read(member))
-                got.add(member)
+            for member in z.namelist():
+                base = member.rsplit("/", 1)[-1]
+                if base in want and base not in got:
+                    out = S / "sp" / "images" / base
+                    if not out.exists():
+                        out.write_bytes(z.read(member))
+                    got.add(base)
     print(f"[sp] extracted {len(got)}/{len(want)}")
     with open(ann, "w") as f:
-        for member in sorted(got):
-            p = want[member]
+        for base in sorted(got):
+            p = want[base]
             f.write(json.dumps({
                 "id": f"vg_{p['image_id']}",
-                "image_path": f"images/{member.replace('/', '_')}",
+                "image_path": f"images/{base}",
                 "paragraph": p["paragraph"],
             }, ensure_ascii=False) + "\n")
     print(f"[sp] jsonl rows {len(got)}")
