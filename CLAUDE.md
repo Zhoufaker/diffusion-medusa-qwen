@@ -103,6 +103,14 @@
   export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
 - ~/.cursor-server 属可安全删除项（误删活跃版本仅触发下次连接时重新下载约 500MB，
   无数据损失）；home 吃紧时优先清理其旧版本目录（bin/linux-x64/ 下非最新 mtime 的目录）
+- home 治理（2026-08-20 落实，事故：home 曾爆至 10.57G/10G 硬限）：
+  - Claude Code CLI 旧版本二进制在 ~/.claude/remote/ccd-cli/（每版 ~300M），
+    home 吃紧时删非当前版本（先 ps 确认在用版本再删）；DISABLE_AUTOUPDATER=1
+    已入 ~/.bashrc，版本更新改手动择机
+  - ~/.bashrc 已重定向：XDG_CACHE_HOME 与 NPM_CONFIG_CACHE → scratch
+    （兜住 torch hub/matplotlib/npm 等杂项缓存）
+  - ~/.claude/settings.json 已设 cleanupPeriodDays=7（会话记录 7 天自动清；
+    projects/ 现仅 ~7M，警戒线 500M）
 - scratch 两个已知风险，写入前评估：
   1. 100 天未访问自动清除——长期资产（如 base_lm_head、固定数据）需在报告中标注
      "建议本地备份"；训练期间高频访问的文件不受影响
