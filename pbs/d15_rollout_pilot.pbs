@@ -27,7 +27,7 @@ export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
 
-P=/scratch/li96/mz9869/dflash_data/longform_fixed_v1/pilot
+P=/scratch/li96/mz9869/dflash_data/longform_fixed_v2/pilot
 OUT=${P}/rollout512
 mkdir -p ${OUT}
 cd /home/562/mz9869/medusa-qwen

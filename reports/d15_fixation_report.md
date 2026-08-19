@@ -1,5 +1,8 @@
 # D1.5 长文本数据固定报告（阶段一：盘点与固定）
 
+> **v2 节见文末**（2026-08-20 起 longform_fixed_v2 为现行版本，37,079 条；
+> 本文上半部为 v1 历史记录，v1 目录保留只读）。
+
 2026-08-19。零 GPU、零 qsub。协议权威：mage_pack `longform_dataset_registry.py`
 （sha256 `7e736eb0…`，项目副本 external/，原包只读）。
 产出：`/scratch/li96/mz9869/dflash_data/longform_fixed_v1/`。
@@ -116,3 +119,43 @@ staging 散件已清（−14.8K inode，702.5K→687.7K）；staging 保留官�
 - 收尾插曲：补跑收尾 sanity assert 未兼容 prior-only 统计条目而崩
   （数据零影响——打包先于断言完成）；断言已修，manifest 由 finalizer 重写
   并复跑零交集终检，全程 fixation.log 在案
+
+---
+
+# v2 节（longform_fixed_v2，2026-08-20 定稿）
+
+## 裁决与范围（用户 2026-08-19 下达）
+只用 train split 原则；DOCCI 切分修正（全 split 14,847 → **train 9,647**）；
+新源 SP + LN-OI；VizWiz-LF 探明不做（600 对 <1K 门槛 + 多为 VLM 生成答案 +
+BLV 隐私域）；目标 35-37K；v1 保留只读。执行走用户特批的 copyq 单作业链。
+
+## 终态（job 176678578，哨兵在案）
+
+| 源 | 入库 | dup_eval | ref token 均长/中位/p90 | ≥300 |
+|---|---|---|---|---|
+| DOCCI(train) | 9,647 | 0 | 139.5 / 130 / 208 | 1.0% |
+| DetailCaps | 4,868 | 0 | 228.8 / 229 / 265 | 2.3% |
+| SP(train) | **14,564** | **11**(VG↔COCO 血缘实测) | 70.3 / 73 / 98 | 0% |
+| LN-OI(采样) | 8,000 | 0 | 39.8 / 36 / 66 | 0% |
+| **合计** | **37,079 / 38 片** | 11 | **加权均长 ~103** | — |
+
+- 零交集终检通过;各源抽检 5/5 ×4 全过(解码/模板;docci/sp/ln 并对源
+  reference 逐字节核对,dc 为构造性保真)
+- LN:8,000 采样 CVDF 下载仅 1 败且 Flickr 兜底成功,最终 0 损耗
+- SP 事故与纠正:首跑漏配 8,077 张(images.zip 成员无目录前缀,
+  匹配键误带前缀;6,502=带前缀侧全中,数字闭合)→ 基名匹配修正后
+  纠正重跑(21 分钟,5.72 SU)。首跑 77.19 SU 计入损耗
+  (copyq 按内存折算 ~16 SU/h,前估 15 严重偏低,教训登记)
+- **⚠ 长文本属性进一步稀释(如实报)**:池子加权均长 v1 ~162 → v2 **~103**
+  (SP 70.3、LN 39.8 拉低)。max_new 裁定与"长文本"叙事请结合此实测
+- 元数据 tar:archives/longform_fixed_v2_meta.tar.gz,
+  sha256 **f1aee1a6e47f…**——**请下载本地备份(3c42dba8/27fb361e 版均作废)**
+- SP 标注来源:官方 zip 的 wayback 20230307 快照(19,561 段,
+  切分 14,575/2,487/2,489 与公开统计吻合);VG 图像官方 zip 15.2GB
+- 许可:DOCCI CC BY 4.0;SP/VG CC BY 4.0;LN 标注 CC BY 4.0 +
+  OI 图像 CC BY 2.0(Flickr 源);DetailCaps 见数据卡
+
+## 送审件(本块唯一送审出口)
+rollout 长度 pilot v2 版:50 条按源占比分层(docci 13/dc 7/sp 19/ln 11,
+seed=43),gen_cache_rollout.py 零改动 + prep 适配层,--max-new 512,
+dgxa100 30min/<10 SU。PBS: pbs/d15_rollout_pilot.pbs。等审。

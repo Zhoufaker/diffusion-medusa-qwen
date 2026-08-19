@@ -14,8 +14,9 @@ import tarfile
 from pathlib import Path
 
 SEED = 43
-N_PER_SOURCE = {"docci": 40, "detailcaps": 10}
-BASE = Path("/scratch/li96/mz9869/dflash_data/longform_fixed_v1")
+# v2 源占比分层(37,079 条:26.0/13.1/39.3/21.6%),四舍五入调平至 50
+N_PER_SOURCE = {"docci": 13, "detailcaps": 7, "sp": 19, "ln": 11}
+BASE = Path("/scratch/li96/mz9869/dflash_data/longform_fixed_v2")
 OUT = BASE / "pilot"
 
 
