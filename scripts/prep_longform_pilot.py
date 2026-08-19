@@ -8,12 +8,23 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import random
 import tarfile
+from io import BytesIO
 from pathlib import Path
 
+from PIL import Image
+from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+
 SEED = 43
+# PREPROCESS_SPEC 适配(2026-08-20 裁决,longform 线 max_pixels=501760):
+# 仅对 cap binding 的图像按 smart_resize 目标尺寸预缩放(PIL BICUBIC,
+# PNG 无损),使 gen_cache_rollout.py 【零改动】即得 capped vision token 数
+# (与 decode.common.apply_max_pixels 的 processor 侧 cap 逐位同 token 数;
+# 重采样核微差属登记类数值扰动)。未触线图像原字节透传。
+FACTOR, MIN_PX = 28, 3136  # mirrors decode.common.apply_max_pixels
 # v2 修订配额(用户 2026-08-20):占比调平 + 每源下限 10
 N_PER_SOURCE = {"docci": 12, "detailcaps": 10, "sp": 16, "ln": 12}
 # max_new 裁定规则(预注册,写入 pilot_manifest):
@@ -24,7 +35,27 @@ BASE = Path("/scratch/li96/mz9869/dflash_data/longform_fixed_v2")
 OUT = BASE / "pilot"
 
 
+def save_image(raw: bytes, name: str, out_dir: Path, cap: int | None) -> tuple[str, bool]:
+    """Write one pilot image; pre-resize iff the pixel cap binds. -> (fname, bound)"""
+    if cap is not None:
+        img = Image.open(BytesIO(raw))
+        w, h = img.size
+        if round(h / FACTOR) * FACTOR * round(w / FACTOR) * FACTOR > cap:
+            h2, w2 = smart_resize(h, w, factor=FACTOR, min_pixels=MIN_PX,
+                                  max_pixels=cap)
+            out_name = name.rsplit(".", 1)[0] + ".png"
+            img.convert("RGB").resize((w2, h2), Image.BICUBIC).save(out_dir / out_name)
+            return out_name, True
+    (out_dir / name).write_bytes(raw)
+    return name, False
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--max-pixels", type=int, default=None,
+                    help="longform PREPROCESS_SPEC cap (501760); None = v1 行为")
+    args = ap.parse_args()
+    sfx = f"_px{args.max_pixels}" if args.max_pixels else ""
     rows = [json.loads(l) for l in open(BASE / "triplets.jsonl")]
     by_src = {}
     for i, r in enumerate(rows):
@@ -33,8 +64,10 @@ def main() -> int:
     picks = []
     for src, k in N_PER_SOURCE.items():
         picks += sorted(rng.sample(by_src[src], k))
-    (OUT / "images").mkdir(parents=True, exist_ok=True)
+    img_dir = OUT / f"images{sfx}"
+    img_dir.mkdir(parents=True, exist_ok=True)
     prompts = []
+    n_bound = 0
     byshard = {}
     for i in picks:
         byshard.setdefault(i // 1000, []).append(i)
@@ -44,17 +77,27 @@ def main() -> int:
                      if not m.name.endswith(".json")}
             for i in idxs:
                 m = names[f"{i:06d}"]
-                (OUT / "images" / m.name).write_bytes(tf.extractfile(m).read())
+                fname, bound = save_image(tf.extractfile(m).read(), m.name,
+                                          img_dir, args.max_pixels)
+                n_bound += bound
                 r = rows[i]
                 prompts.append({"id": r["sample_id"].replace("/", "_"),
-                                "image": m.name, "question": r["question"]})
-    json.dump(prompts, open(OUT / "pilot_prompts.json", "w"),
+                                "image": fname, "question": r["question"]})
+    json.dump(prompts, open(OUT / f"pilot_prompts{sfx}.json", "w"),
               ensure_ascii=False, indent=1)
-    json.dump({"seed": SEED, "n_per_source": N_PER_SOURCE,
-               "max_new_decision_rule_prereg": MAX_NEW_RULE,
-               "picked_row_indices": picks},
-              open(OUT / "pilot_manifest.json", "w"), indent=1)
-    print(f"[pilot-prep] {len(prompts)} prompts, images -> {OUT/'images'}")
+    meta = {"seed": SEED, "n_per_source": N_PER_SOURCE,
+            "max_new_decision_rule_prereg": MAX_NEW_RULE,
+            "picked_row_indices": picks}
+    if args.max_pixels:
+        meta["preprocess_spec"] = {
+            "max_pixels": args.max_pixels, "factor": FACTOR, "min_pixels": MIN_PX,
+            "impl": "prep-side pre-resize of cap-bound images only "
+                    "(smart_resize dims, PIL BICUBIC, lossless PNG); "
+                    "token-count-exact vs processor-side apply_max_pixels",
+            "n_prebound": n_bound}
+    json.dump(meta, open(OUT / f"pilot_manifest{sfx}.json", "w"), indent=1)
+    print(f"[pilot-prep] {len(prompts)} prompts, images -> {img_dir}"
+          + (f", cap-bound resized: {n_bound}" if args.max_pixels else ""))
     return 0
 
 

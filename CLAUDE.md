@@ -16,6 +16,11 @@
 - 三层评估：训练分布（self-distillation rollouts）→ in-domain 300-prompt held-out → MM-Vet OOD 218 prompts
 - in-domain 300 为嵌套设计（seed=43），其中旧 100 条为字节级回归门
 - MM-Vet 评估固定 max_pixels=501760，在 V100 上跑
+- PREPROCESS_SPEC 双规并存（2026-08-20 裁决）：longform 线（rollout 生成/
+  特征抽取/longform 评估三处）统一 max_pixels=501760，与 MM-Vet OOD 锚定
+  约定对齐；短线旧资产（34,999 缓存及其评估）保持原 spec（无 cap）不动。
+  两 spec 不得混用；登记与动因（2.34TB 外推、vision token 占 76.7%）见
+  reports/d15_rollout_pilot_report.md 与 d15_fixation_report.md 登记节
 - 训练数据：34,999 条 self-distillation 缓存（Qwen2.5-VL-7B greedy rollouts，TARGET convention），与评估图像双键去重
 - 计时锚点：pooled greedy 29.918 tok/s（旧线数值；新线 verify 形态不同，计时锚点需重新预注册后才可引用）
 

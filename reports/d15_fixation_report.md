@@ -167,3 +167,22 @@ ref 均长稀释(~103)仅涉【谱系锚】——reference 只作数据固定与
 为准**,与 ref 长度无必然耦合。max_new 裁定规则已预注册于 pilot manifest:
 worst-source trunc@384 ≤5% → 384;否则 512(512 为测量上限,超限如实
 登记仍取 512)。
+
+## PREPROCESS_SPEC 裁决登记(2026-08-20,用户裁决)
+
+动因:rollout pilot 首跑(176689374)实测 T̄=1758.6,37K 特征缓存外推
+2,337 GB;诊断 vision token 占 T̄ 的 76.7%(v2 池 DOCCI 高清图源均
+3,865 vis tok),为体积主因(reports/d15_rollout_pilot_report.md)。
+
+裁决内容:
+- **longform 线 PREPROCESS_SPEC:max_pixels=501760**,覆盖三处——
+  rollout 生成、特征抽取、longform 评估,三处同 spec;与 MM-Vet OOD
+  锚定约定(V100,max_pixels=501760)对齐,实现同源
+  (decode/common.py apply_max_pixels:min_pixels 3136 不动,仅 max 侧收紧)
+- **短线旧 spec 不动**:34,999 旧缓存及其评估管线保持无 cap 原样
+  (COCO 小图 cap 从未 binding,旧 spec 事实上等价于无上限)
+- 双 spec 并存,不得混用;已同步写入 CLAUDE.md 锁定评估体系节
+- pilot 按新 spec 同 50 条同 seed 重跑(免审档),max_new 按原预注册
+  规则对新数据重裁;pre-resize 适配说明:仅对 cap binding 的图像按
+  smart_resize 目标尺寸预缩放(PIL BICUBIC,PNG 无损),vision token
+  数与 processor 侧 cap 逐位一致,重采样核微差属登记类数值扰动
