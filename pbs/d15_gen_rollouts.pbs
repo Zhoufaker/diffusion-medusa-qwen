@@ -1,7 +1,8 @@
 #!/bin/bash
-# D1.5 v2 批量 rollout 生成(37,079 条)——【必审档草案,发审查,未获批不 qsub】
-# 预算字段 walltime = TBD:待 px 重跑 pilot(176694274)出数后按吞吐外推填定,
-# 连同 reports/d15_gen_rollouts_budget.md 一并送审。
+# D1.5 v2 批量 rollout 生成(37,079 条)——【必审档,发审查,未获批不 qsub】
+# 预算已按 px 重跑 pilot(176694274)实测回填:R1=0.0958 row/s,E=3 保守
+# 外推 35.8 GPU·h / 2,581 SU;walltime 7h/shard(含 1.5 安全系数)。
+# 预算全文见 reports/d15_gen_rollouts_budget.md(整包送审)。
 # 结构参考 6 月 8-shard 模板(gen_cache_full.pbs);差异(登记):
 #   - 连续区间分片(tar 局部性)而非 idx%K;
 #   - 输出为逐 shard JSONL(inode 纪律)而非 37K 散 .pt;
@@ -14,7 +15,7 @@
 #PBS -l ngpus=1
 #PBS -l mem=100GB
 #PBS -l jobfs=10GB
-#PBS -l walltime=TBD_AFTER_PX_PILOT
+#PBS -l walltime=07:00:00
 #PBS -l storage=gdata/li96+scratch/li96
 #PBS -l wd
 #PBS -N d15_gen_rollouts
