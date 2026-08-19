@@ -39,32 +39,61 @@ python scripts/gen_cache_rollout.py \
     --max-new 512
 RC=$?
 python - <<PYEOF
-import json, glob, statistics as st
+import json, glob, statistics as st, sys
 import torch
-files = sorted(glob.glob("${OUT}/*.pt"))
-Ls = []
-for f in files:
-    Ls.append(int(torch.load(f, map_location="cpu",
-                             weights_only=True)["tokens"].shape[0]))
-Ls.sort(); n = len(Ls)
+sys.path.insert(0, "/home/562/mz9869/medusa-qwen")
+from decode.common import make_image_inputs
+from transformers import AutoProcessor, AutoTokenizer
+from pathlib import Path
+prompts = json.load(open("${P}/pilot_prompts.json"))
+# id = sample_id 的 '/'→'_':docci_… / detailcaps_… / sp_… / ln_…,源名=首段
+src_of = {p["id"]: p["id"].split("_")[0] for p in prompts}
+proc = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+Ts = []
+stats = {}
+for i, p in enumerate(prompts):
+    fp = Path("${OUT}") / f"{i}.pt"
+    if not fp.exists():
+        continue
+    L = int(torch.load(fp, map_location="cpu", weights_only=True)["tokens"].shape[0])
+    P_len = make_image_inputs(proc, p["question"],
+                              Path("${P}/images") / p["image"], "cpu")["input_ids"].shape[1]
+    Ts.append(P_len + L)
+    stats.setdefault(src_of[p["id"]], []).append(L)
+def agg(Ls):
+    Ls = sorted(Ls); n = len(Ls)
+    return {"n": n, "mean": round(st.mean(Ls), 1), "med": Ls[n // 2],
+            "p90": Ls[min(n - 1, 9 * n // 10)], "max": Ls[-1],
+            "trunc_at_384": round(sum(1 for x in Ls if x >= 384) / n, 3),
+            "trunc_at_512": round(sum(1 for x in Ls if x >= 512) / n, 3)}
+per_source = {k: agg(v) for k, v in stats.items()}
+pooled = agg([x for v in stats.values() for x in v])
+worst384 = max(v["trunc_at_384"] for v in per_source.values())
+decision = 384 if worst384 <= 0.05 else 512
+T_mean = st.mean(Ts)
+cache_gb = 37079 * T_mean * 5 * 3584 * 2 / 1e9
 s = {"job": "${PBS_JOBID}", "kind": "d15_rollout_pilot", "exit": ${RC},
-     "n": n}
-if n:
-    s.update(mean=round(st.mean(Ls), 1), med=Ls[n // 2], p10=Ls[n // 10],
-             p90=Ls[9 * n // 10], max=Ls[-1],
-             trunc_at_384=sum(1 for x in Ls if x >= 384) / n,
-             trunc_at_512=sum(1 for x in Ls if x >= 512) / n)
+     "per_source": per_source, "pooled": pooled,
+     "worst_source_trunc_at_384": worst384,
+     "max_new_decision_prereg": decision,
+     "full_seq_mean_T": round(T_mean, 1),
+     "feature_cache_extrapolation_37k_gb": round(cache_gb, 1)}
 json.dump(s, open("${OUT}/JOB_DONE_${PBS_JOBID%%.*}.json", "w"), indent=1)
-print("sentinel:", s)
-# 3 条样例全文(idx 0/1/2)供人工过目
-from transformers import AutoTokenizer
+print("sentinel:", json.dumps(s)[:800])
+# 每源各 1 条样例全文
 tk = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct")
+seen = set()
 with open("${OUT}/samples_for_review.txt", "w") as fo:
-    for f in files[:3]:
-        toks = torch.load(f, map_location="cpu", weights_only=True)["tokens"]
-        fo.write(f"===== {f} ({toks.shape[0]} tok) =====\n")
+    for i, p in enumerate(prompts):
+        srcname = src_of[p["id"]]
+        fp = Path("${OUT}") / f"{i}.pt"
+        if srcname in seen or not fp.exists():
+            continue
+        seen.add(srcname)
+        toks = torch.load(fp, map_location="cpu", weights_only=True)["tokens"]
+        fo.write(f"===== [{srcname}] {p['id']} ({toks.shape[0]} tok) =====\n")
         fo.write(tk.decode(toks.tolist()) + "\n\n")
-print("samples -> ${OUT}/samples_for_review.txt")
+print("samples (1/source) -> ${OUT}/samples_for_review.txt")
 PYEOF
 echo "=== DONE $(date) rc=${RC} ==="
 exit ${RC}

@@ -159,3 +159,11 @@ BLV 隐私域）；目标 35-37K；v1 保留只读。执行走用户特批的 co
 rollout 长度 pilot v2 版:50 条按源占比分层(docci 13/dc 7/sp 19/ln 11,
 seed=43),gen_cache_rollout.py 零改动 + prep 适配层,--max-new 512,
 dgxa100 30min/<10 SU。PBS: pbs/d15_rollout_pilot.pbs。等审。
+
+## v2 补记(2026-08-20,叙事澄清)
+ref 均长稀释(~103)仅涉【谱系锚】——reference 只作数据固定与审计对照,
+不进训练。question 模板四源恒定(LONGFORM_PROMPT),故 rollout 长度的
+源间差异纯由图像内容驱动;**实际训练 token 量以 pilot 实测 rollout 长度
+为准**,与 ref 长度无必然耦合。max_new 裁定规则已预注册于 pilot manifest:
+worst-source trunc@384 ≤5% → 384;否则 512(512 为测量上限,超限如实
+登记仍取 512)。

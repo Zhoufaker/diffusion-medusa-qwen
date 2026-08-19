@@ -14,8 +14,12 @@ import tarfile
 from pathlib import Path
 
 SEED = 43
-# v2 源占比分层(37,079 条:26.0/13.1/39.3/21.6%),四舍五入调平至 50
-N_PER_SOURCE = {"docci": 13, "detailcaps": 7, "sp": 19, "ln": 11}
+# v2 修订配额(用户 2026-08-20):占比调平 + 每源下限 10
+N_PER_SOURCE = {"docci": 12, "detailcaps": 10, "sp": 16, "ln": 12}
+# max_new 裁定规则(预注册,写入 pilot_manifest):
+MAX_NEW_RULE = ("worst-source trunc@384 <=5% -> max_new=384; otherwise 512 "
+                "(512 is the measurement ceiling; if exceeded, register "
+                "truthfully and still take 512)")
 BASE = Path("/scratch/li96/mz9869/dflash_data/longform_fixed_v2")
 OUT = BASE / "pilot"
 
@@ -47,6 +51,7 @@ def main() -> int:
     json.dump(prompts, open(OUT / "pilot_prompts.json", "w"),
               ensure_ascii=False, indent=1)
     json.dump({"seed": SEED, "n_per_source": N_PER_SOURCE,
+               "max_new_decision_rule_prereg": MAX_NEW_RULE,
                "picked_row_indices": picks},
               open(OUT / "pilot_manifest.json", "w"), indent=1)
     print(f"[pilot-prep] {len(prompts)} prompts, images -> {OUT/'images'}")
