@@ -54,7 +54,8 @@
    验 JSONL/哨兵/manifest 全链 + 同条配对实测 E(bs=8 vs bs=1,
    口径见上节;E<1.5 中止改预案)
 2. 断点演练:冒烟中途 qdel 一次,重提验幂等(文件级 sha 对照)
-3. 全量 8-shard array
+3. 全量 8-shard(审查修订:scripts/submit_gen_rollouts.sh 循环 qsub
+   8 个独立作业,弃 array;E 确认 + 用户"放"为前置门)
 4. 事后对照(非门,登记):50 条 pilot 行的批量输出 vs bs=1 pilot 输出,
    报 token 级一致率——fp16 批扰动的实测标定,写入生成报告
 

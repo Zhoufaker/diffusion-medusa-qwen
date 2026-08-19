@@ -19,6 +19,7 @@ from gen_longform_rollouts import (  # noqa: E402
     EFFECTIVE_VOCAB,
     assert_left_padded,
     build_manifest,
+    code_commit,
     iter_batches,
     make_record,
     repair_and_load,
@@ -27,6 +28,7 @@ from gen_longform_rollouts import (  # noqa: E402
     token_sha256,
     trim_new_tokens,
     validate_record,
+    verify_pool,
 )
 
 PAD = 151643
@@ -213,3 +215,27 @@ def test_iter_batches():
 def test_effective_vocab_matches_decode_common():
     from decode.common import EFFECTIVE_VOCAB as EV
     assert EFFECTIVE_VOCAB == EV
+
+
+# ---------------------------------------------------------------- 审查修订(2026-08-20)
+
+
+def test_verify_pool_assertions_trigger(tmp_path):
+    import hashlib
+    fp = tmp_path / "triplets.jsonl"
+    fp.write_bytes(b'{"a":1}\n{"a":2}\n')
+    rows = [{"a": 1}, {"a": 2}]
+    good_sha = hashlib.sha256(fp.read_bytes()).hexdigest()
+    verify_pool(fp, rows, expect_total=2, expect_sha256=good_sha)  # no raise
+    verify_pool(fp, rows)  # 两断言均可选
+    with pytest.raises(ValueError):
+        verify_pool(fp, rows, expect_total=3)
+    with pytest.raises(ValueError):
+        verify_pool(fp, rows, expect_total=2, expect_sha256="0" * 64)
+
+
+def test_code_commit_field_in_manifest_config():
+    c = code_commit()
+    assert c != "unknown" and all(ch in "0123456789abcdef" for ch in c)
+    m = build_manifest({}, 0, {"code_commit": c})
+    assert m["config"]["code_commit"] == c

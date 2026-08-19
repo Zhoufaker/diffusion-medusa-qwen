@@ -1,13 +1,19 @@
 #!/bin/bash
-# D1.5 v2 批量 rollout 生成(37,079 条)——【必审档,发审查,未获批不 qsub】
-# 预算已按 px 重跑 pilot(176694274)实测回填:R1=0.0958 row/s,E=3 保守
-# 外推 35.8 GPU·h / 2,581 SU;walltime 7h/shard(含 1.5 安全系数)。
-# 预算全文见 reports/d15_gen_rollouts_budget.md(整包送审)。
-# 结构参考 6 月 8-shard 模板(gen_cache_full.pbs);差异(登记):
-#   - 连续区间分片(tar 局部性)而非 idx%K;
-#   - 输出为逐 shard JSONL(inode 纪律)而非 37K 散 .pt;
-#   - 批量 generate(bs 可配)+ 三处谱系口径对齐(见脚本 docstring)。
-# 收尾:全部 array 子作业完成后在【登录节点】跑
+# D1.5 v2 批量 rollout 生成(37,079 条)——审查修订版(2026-08-20 过审)。
+# 预算:R1=0.0958 row/s,E=3 保守外推 35.8 GPU·h / 2,581 SU;walltime
+# 7h/shard(含 1.5 安全系数);全文见 reports/d15_gen_rollouts_budget.md。
+# 提交形态(审查修订 B1):【去 array 化】——经 scripts/submit_gen_rollouts.sh
+# 循环 qsub -v SHARD_ID=$s 提交 8 个独立作业。6 月模板 gen_cache_full.pbs
+# 的实际提交方式已查:提交日志已轮转无存证,且其 -J 0-7 指令与自身注释
+# "0-15 -> 16 shards"不一致(提示曾手改复用)——结论:array 形态无可靠
+# 先例存证,弃之;独立作业便于单 shard 重提/止损,天然保留冒烟-放行人工门。
+# 结构差异(对旧线 gen_cache_full,登记):连续区间分片(tar 局部性)而非
+# idx%K;逐 shard JSONL(inode 纪律)而非散 .pt;批量 generate + 三处
+# 谱系口径对齐(见脚本 docstring)。
+# 加载后断言(审查修订 2):--expect-total 37079 + triplets.jsonl sha256
+# pin(06b6f55b…,2026-08-20 实测登记;fixation manifest 无此字段),
+# 不符即停。
+# 收尾:8 作业全完成后在【登录节点】跑
 #   python scripts/gen_longform_rollouts.py --out-dir <OUT> --manifest-only
 #PBS -P li96
 #PBS -q dgxa100
@@ -24,7 +30,6 @@
 #PBS -m ae
 #PBS -M 920928763@qq.com
 #PBS -r y
-#PBS -J 0-7
 
 set -u
 module load python3/3.11.0 cuda/12.3.2
@@ -35,7 +40,7 @@ export TRANSFORMERS_OFFLINE=1
 export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
 
 NUM_SHARDS=8
-SHARD_ID=${PBS_ARRAY_INDEX:-0}
+SHARD_ID=${SHARD_ID:-0}
 BS=8
 OUT=/scratch/li96/mz9869/dflash_data/longform_fixed_v2/rollouts_px501760
 mkdir -p ${OUT}
@@ -49,7 +54,9 @@ python -u scripts/gen_longform_rollouts.py \
     --max-new 512 \
     --batch-size ${BS} \
     --shard-id ${SHARD_ID} \
-    --num-shards ${NUM_SHARDS}
+    --num-shards ${NUM_SHARDS} \
+    --expect-total 37079 \
+    --triplets-sha256 06b6f55b3badb739f2c10b92141ddba8784f3a4a9026107a2b44caa31b51f81f
 RC=$?
 
 # 逐子作业哨兵(汇总本 shard 文件实态,哈希优先口径)

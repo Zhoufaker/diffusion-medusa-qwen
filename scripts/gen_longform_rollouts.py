@@ -178,6 +178,33 @@ def trim_new_tokens(row, eos_id: int):
     return toks, False
 
 
+def verify_pool(triplets_path, rows, expect_total=None, expect_sha256=None) -> None:
+    """加载后断言(审查修订 2026-08-20,不符即停):
+    - 行数 == --expect-total(PBS 传 37079);
+    - triplets.jsonl 全文 sha256 == --triplets-sha256(等价内在键——
+      jsonl 无 idx 列,行号 ↔ 图像 tar 成员 {i:06d} 的绑定由字节级锁定
+      保障,文件重排/截断/换版一律拦下)。"""
+    if expect_total is not None and len(rows) != expect_total:
+        raise ValueError(f"pool size {len(rows)} != expected {expect_total}")
+    if expect_sha256:
+        h = hashlib.sha256(Path(triplets_path).read_bytes()).hexdigest()
+        if h != expect_sha256:
+            raise ValueError(
+                f"triplets sha256 {h[:16]}... != expected {expect_sha256[:16]}...")
+
+
+def code_commit() -> str:
+    """manifest 谱系字段:生成时代码 commit(取本文件所在仓库;无 git 时 unknown)。"""
+    try:
+        import subprocess
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent, capture_output=True,
+            text=True, timeout=10, check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
 def build_manifest(shard_files: dict, total: int, config: dict) -> dict:
     """shard_files: {name: {"n": int, "sha256": str}}。"""
     n = sum(v["n"] for v in shard_files.values())
@@ -264,6 +291,10 @@ def main() -> int:
     ap.add_argument("--shard-id", type=int, default=0)
     ap.add_argument("--num-shards", type=int, default=1)
     ap.add_argument("--limit", type=int, default=None, help="cap total rows (smoke)")
+    ap.add_argument("--expect-total", type=int, default=None,
+                    help="断言全池行数(PBS 传 37079),不符即停")
+    ap.add_argument("--triplets-sha256", default=None,
+                    help="断言 triplets.jsonl 全文 sha256(等价内在键),不符即停")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--manifest-only", action="store_true")
     args = ap.parse_args()
@@ -271,6 +302,7 @@ def main() -> int:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(l) for l in open(args.triplets)]
+    verify_pool(args.triplets, rows, args.expect_total, args.triplets_sha256)
     if args.limit is not None:
         rows = rows[: args.limit]
     total = len(rows)
@@ -279,7 +311,8 @@ def main() -> int:
               "num_shards": args.num_shards, "sharding": "contiguous",
               "greedy": True, "repetition_penalty": 1.0,
               "eos": "tokenizer.eos_token_id only, first EOS included",
-              "phantom_mask": f">= {EFFECTIVE_VOCAB} suppressed"}
+              "phantom_mask": f">= {EFFECTIVE_VOCAB} suppressed",
+              "code_commit": code_commit()}
 
     if args.manifest_only:
         return 0 if finalize_manifest(out_dir, total, config) else 1
