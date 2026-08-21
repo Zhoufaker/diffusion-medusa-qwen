@@ -171,6 +171,37 @@ def flush_shard(out_dir: Path, shard_id: int, buf: dict, partial: bool) -> str:
     return name
 
 
+def merge_manifest(old, new):
+    """R1(审查修订 2026-08-21):manifest 合并写。已存在 ctx_manifest.json
+    时载入合并——samples/shards 字典合并(同 key 以新为准,重跑修复语义)、
+    range 取并区间、aggregate 逐 run 追加历史(每 run 携 run_range)。
+    分段跑全量(如 pilot 512 + 续段)不再互相覆盖登记。"""
+    if old is None:
+        return new
+    m = dict(new)
+    m["samples"] = {**old.get("samples", {}), **new.get("samples", {})}
+    m["shards"] = {**{str(k): v for k, v in old.get("shards", {}).items()},
+                   **{str(k): v for k, v in new.get("shards", {}).items()}}
+    m["range"] = [min(old["range"][0], new["range"][0]),
+                  max(old["range"][1], new["range"][1])]
+    hist = list(old.get("aggregate_runs",
+                        [old["aggregate"]] if "aggregate" in old else []))
+    m["aggregate_runs"] = hist + [new["aggregate"]]
+    return m
+
+
+def mismatch_head16(pred, exp, logits, cap: int = 16):
+    """R2(审查修订 2026-08-21):TF 诊断 mismatch 前 cap 个位置,schema 与
+    35K 缓存一致([{"pos": int, "gap": float}]),W2 实际读取口径
+    train/train_drafter.py L326/336(取 e["pos"];gap 供近平局分桶)。"""
+    match = pred == exp
+    out = []
+    for j in (~match).nonzero(as_tuple=True)[0][:cap].tolist():
+        gap = float(logits[j, pred[j]] - logits[j, exp[j]])
+        out.append({"pos": int(j), "gap": round(gap, 6)})
+    return out
+
+
 def freeze_preprocess_spec(processor) -> dict:
     spec = dict(PREPROCESS_SPEC)
     ip = processor.image_processor
@@ -208,11 +239,14 @@ def extract_one(base, inputs, rollout_tokens: torch.Tensor, device: str):
     )
     ctx = torch.stack([out.hidden_states[t][0] for t in HIDDEN_TUPLE_IDS])
     logits = mask_phantom_(out.logits[0, P - 1 : P + L - 1, :].float())
-    n_match = int((logits.argmax(-1) == rollout_tokens.to(device)).sum())
+    pred = logits.argmax(-1)
+    exp = rollout_tokens.to(device)
+    n_match = int((pred == exp).sum())
+    mismatch = mismatch_head16(pred, exp, logits) if n_match < L else []
     ctx_cpu = ctx.to("cpu", torch.bfloat16).contiguous()
     ids_cpu = full_ids[0].to("cpu", torch.int64).contiguous()
     del out, ctx, logits
-    return ctx_cpu, ids_cpu, P, L, n_match
+    return ctx_cpu, ids_cpu, P, L, n_match, mismatch
 
 
 def main() -> int:
@@ -273,7 +307,7 @@ def main() -> int:
                 messages, tokenize=False, add_generation_prompt=True)
             inputs = processor(text=[text], images=[img],
                                return_tensors="pt", padding=True).to(args.device)
-            ctx, ids, P, L, n_match = extract_one(
+            ctx, ids, P, L, n_match, mismatch = extract_one(
                 base, inputs, rollout_tokens, args.device)
             spans = make_spans(ids, P, L, image_pad_id)
         except Exception as e:  # noqa: BLE001 — 逐样本故障隔离,计数+末尾对账
@@ -286,7 +320,7 @@ def main() -> int:
             "idx": i, "shard": shard_id, "T": P + L, "P": P, "L": L,
             "sample_id": rows[i]["sample_id"], "source": rows[i]["source"],
             "rollout_sha256": rec["sha256"], "eos_hit": rec["eos_hit"],
-            "n_pos": L, "n_match": n_match,
+            "n_pos": L, "n_match": n_match, "mismatch_head16": mismatch,
         }
         n_pos_total += L
         n_match_total += n_match
@@ -314,6 +348,7 @@ def main() -> int:
         "throughput_tok_per_s": tok_count / dt,
         "peak_gpu_mem_gib": round(peak_gb, 2),
         "wall_s": round(dt, 1),
+        "run_range": [args.start_idx, end],
     }
     manifest = {
         "kind": "longform_ctx_cache_v1",
@@ -331,6 +366,8 @@ def main() -> int:
         "aggregate": agg, "samples": records,
     }
     mpath = out_dir / args.manifest_name
+    if mpath.exists():
+        manifest = merge_manifest(json.load(open(mpath)), manifest)
     json.dump(manifest, open(mpath, "w"), indent=1)
     print(f"[ext] DONE range=[{args.start_idx},{end}) done={n_done} fail={n_failed}\n"
           f"[ext] tf_pos_match={agg['tf_pos_match_rate']:.6f} (diagnostic, no gate)\n"

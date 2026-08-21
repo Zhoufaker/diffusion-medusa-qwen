@@ -1,0 +1,86 @@
+#!/bin/bash
+# 队列② pilot:longform 特征抽取 512 条(2 整片)——预算单 §6 第 1 步。
+# 获批预算:预期 ~12-18 SU,walltime 00:40(00:30 + 加载余量);
+# 独立 out-dir longform_ctx_cache_pilot,免污染正式位。
+# 哨兵四项(评估门下轮由 agent 依预算单执行,本作业只如实登记):
+#   ① 格式抽检(shape/dtype/spans 一致性) ② 实测 GB ×72.42 外推 vs
+#   1,113 GB 预算 ③ tf_posmatch 落点(预期 ~96% 带) ④ 吞吐 → 全量 walltime
+#PBS -P li96
+#PBS -q dgxa100
+#PBS -l ncpus=16
+#PBS -l ngpus=1
+#PBS -l mem=100GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=00:40:00
+#PBS -l storage=gdata/li96+scratch/li96
+#PBS -l wd
+#PBS -N d15_ext_pilot
+#PBS -o /scratch/li96/mz9869/logs/
+#PBS -j oe
+#PBS -m ae
+#PBS -M 920928763@qq.com
+
+set -u
+module load python3/3.11.0 cuda/12.3.2
+source ~/medusa-env/bin/activate
+export HF_HOME=/scratch/li96/mz9869/tmp_hf_download/
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export PIP_CACHE_DIR=/scratch/li96/mz9869/tmp_pip_cache/
+
+OUT=/scratch/li96/mz9869/dflash_data/longform_ctx_cache_pilot
+cd /home/562/mz9869/medusa-qwen
+echo "=== d15_ext_pilot $(date) commit $(git rev-parse --short HEAD) ==="
+
+python -u scripts/extract_ctx_longform.py \
+    --out-dir ${OUT} --start-idx 0 --end-idx 512
+RC=$?
+
+python - <<PYEOF
+import json, sys
+from pathlib import Path
+import torch
+from safetensors.torch import load_file
+OUT = Path("${OUT}")
+m = json.load(open(OUT / "ctx_manifest.json"))
+agg = m["aggregate"]
+shard_bytes = sum((OUT / f).stat().st_size for f in m["shards"].values())
+gb = shard_bytes / 1e9
+extrap_gb = gb * 37079 / 512
+dev_pct = (extrap_gb / 1113 - 1) * 100
+tokps = agg["throughput_tok_per_s"]
+full_h = 37079 * 837.2 / max(tokps, 1) / 3600
+# 格式抽检:首片前 3 个样本
+fmt_ok, fmt_err = True, []
+try:
+    t = load_file(OUT / m["shards"]["0"])
+    for i in ("0", "1", "2"):
+        ctx, ids, spans = t[f"{i}.ctx"], t[f"{i}.ids"], t[f"{i}.spans"]
+        ok = (ctx.dtype == torch.bfloat16 and ctx.shape[0] == 5
+              and ctx.shape[2] == 3584 and ids.dtype == torch.int64
+              and spans.dtype == torch.int64 and spans.shape == (6,)
+              and int(spans[5]) == ctx.shape[1] == ids.shape[0]
+              and 0 < int(spans[1]) <= int(spans[3]) == int(spans[4]))
+        if not ok:
+            fmt_ok = False; fmt_err.append(i)
+except Exception as e:
+    fmt_ok, fmt_err = False, [str(e)[:120]]
+mm = sum(len(s.get("mismatch_head16", [])) for s in m["samples"].values()
+         if not s.get("failed"))
+s = {"job": "${PBS_JOBID}", "kind": "d15_extract_pilot", "exit": ${RC},
+     "n_done": agg["n_done"], "n_failed": agg["n_failed"],
+     "pilot_gb": round(gb, 2), "extrap_full_gb": round(extrap_gb, 1),
+     "dev_vs_budget_1113gb_pct": round(dev_pct, 1),
+     "tf_pos_match_rate": round(agg["tf_pos_match_rate"], 6),
+     "mismatch_entries_total": mm,
+     "tok_per_s": round(tokps, 0), "full_walltime_h_est": round(full_h, 2),
+     "peak_gpu_mem_gib": agg["peak_gpu_mem_gib"],
+     "format_check_ok": fmt_ok, "format_err": fmt_err}
+json.dump(s, open(OUT / "JOB_DONE_${PBS_JOBID%%.*}.json", "w"), indent=1)
+print("sentinel:", json.dumps(s))
+sys.exit(0 if (${RC} == 0 and fmt_ok and agg["n_failed"] == 0
+               and agg["n_done"] == 512) else 1)
+PYEOF
+RC2=$?
+echo "=== DONE $(date) rc=${RC2} ==="
+exit ${RC2}
